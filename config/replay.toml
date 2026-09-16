@@ -1,0 +1,6 @@
+# Local deterministic replay profile used by the opening flow and UI tests.
+# It never contacts a broker and it uses a separate ledger selected by the
+# opening script through QUANTPAPER_DB_PATH.
+
+[data]
+mode = "replay"

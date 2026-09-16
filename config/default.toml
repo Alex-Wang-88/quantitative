@@ -1,0 +1,67 @@
+[account]
+name = "safe_paper"
+initial_capital = 1000000.0
+max_gross_exposure = 1.0
+cash_floor = 0.10
+margin_enabled = true
+maintenance_ratio_warning = 1.30
+maintenance_ratio_liquidation = 1.10
+initial_margin_ratio = 0.50
+
+[portfolio]
+min_positions = 20
+max_positions = 30
+candidate_pool_size = 500
+single_weight_cap = 0.08
+industry_weight_cap = 0.25
+max_daily_turnover = 0.15
+max_daily_action_orders = 10
+
+[execution]
+mode = "paper_auto"
+quote_interval_seconds = 60
+manual_confirmation_delay_seconds = 60
+order_expiry_seconds = 300
+order_reissue_cooldown_seconds = 300
+session_rebalance_enabled = true
+session_rebalance = "PM_OPEN"
+session_rebalance_window_minutes = 15
+max_participation_pct = 0.10
+slippage_bps = 5.0
+commission_rate = 0.0003
+stamp_duty_rate = 0.0005
+financing_rate = 0.08
+borrow_rate = 0.10
+
+[model]
+name = "factor_lgbm"
+prediction_horizon_days = 5
+retrain_weekday = 4
+min_training_rows = 500
+validation_fraction = 0.20
+min_validation_days = 20
+artifact_dir = "data/models"
+walkforward_report_path = "data/reports/lightgbm-walkforward-3y.json"
+auto_retrain = true
+
+[data]
+mode = "live"
+historical_provider = "eastmoney"
+realtime_provider = "eastmoney"
+universe = ""
+intraday_interval = "1m"
+stale_after_seconds = 180
+history_lookback_days = 780
+research_universe_limit = 0
+realtime_universe_limit = 500
+fundamentals_universe_limit = 500
+eastmoney_fundamentals_enabled = true
+eastmoney_industry_enabled = false
+eastmoney_sdk_python = ".venv-eastmoney\\Scripts\\python.exe"
+eastmoney_bridge_script = "scripts/eastmoney_readonly_bridge.py"
+eastmoney_token_env = "QUANTPAPER_EASTMONEY_TOKEN"
+eastmoney_terminal_adapter_enabled = true
+eastmoney_terminal_feed_path = "data/runtime/eastmoney-terminal-feed.json"
+
+[notifications]
+enabled = false
