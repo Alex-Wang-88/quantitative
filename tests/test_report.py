@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 from quantpaper.config import AppConfig, ModelConfig, NotificationConfig
 from quantpaper.data import make_demo_provider
 from quantpaper.ledger import Ledger
+import quantpaper.provenance
 from quantpaper.report import ReportGenerator
 from quantpaper.runtime import RuntimeService
 
@@ -218,7 +220,19 @@ def test_stale_walkforward_report_is_downgraded_and_disclosed(tmp_path) -> None:
     exactly like a fresh one.  It must instead lose its OK status and say why."""
 
     walkforward_path = tmp_path / "walkforward.json"
-    _write_walkforward_report(walkforward_path, age_seconds=30 * 86400)
+    _write_walkforward_report(walkforward_path)
+    # STALE 的契约是"报告早于最新的产出模块"，而不是"报告比墙钟旧 30 天"：
+    # 把报告时钟锚定到产出模块的真实 mtime，测试才不会随检出变旧而漂移。
+    from quantpaper.provenance import DEFAULT_WALKFORWARD_PRODUCERS
+    package_root = Path(quantpaper.provenance.__file__).resolve().parent
+    stale_stamp = (
+        max(
+            (package_root / name).stat().st_mtime
+            for name in DEFAULT_WALKFORWARD_PRODUCERS
+        )
+        - 30 * 86400
+    )
+    os.utime(walkforward_path, (stale_stamp, stale_stamp))
     service = RuntimeService(
         config=AppConfig(
             model=ModelConfig(walkforward_report_path=str(walkforward_path)),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,25 @@ from .backtest import BacktestConfig, BacktestResult, FactorBacktester
 from .features import FeatureEngine
 from .model import LightGBMModel
 from .storage import DataQualityReport, HistoricalStore
+
+
+@dataclass(frozen=True)
+class _FoldSpec:
+    """Fold-local inputs collected by ``fit_folds`` for one worker.
+
+    Everything a fold needs is copied here up front, so the worker never has
+    to touch (or lock) the shared ``features``/``training`` frames.
+    """
+
+    fold_number: int
+    train_rows: pd.DataFrame
+    test_rows: pd.DataFrame
+    test_mask: pd.Series
+    train_start: object
+    train_end: object
+    test_start: object
+    test_end: object
+    test_labels: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -40,6 +60,20 @@ class WalkForwardConfig:
     # information that was already available, so it introduces no look-ahead.
     score_smoothing_days: int = 1
     artifact_dir: str | Path = "data/models/walkforward"
+    # Folds are independent (each trains on its own trailing window and scores
+    # a disjoint test window), so they can be fitted concurrently.  LightGBM's
+    # C++ training releases the GIL, which makes a thread pool effective here.
+    # With ``workers > 1`` each fit is pinned to a single LightGBM thread so
+    # concurrent fits do not oversubscribe the machine.  Default ``1`` keeps
+    # the historical sequential behaviour (each fit uses every core).
+    workers: int = 1
+    # LightGBM threads per fit.  ``None`` derives it from ``workers`` (1 when
+    # folding in parallel, LightGBM's all-cores default when sequential).
+    # Setting it explicitly pins every fit -- including sequential ones -- to
+    # that thread count, which also makes results bit-reproducible across
+    # worker counts (LightGBM floating-point summation otherwise varies with
+    # the thread count).
+    threads_per_fit: int | None = None
 
     @property
     def effective_validation_gap_days(self) -> int:
@@ -81,6 +115,12 @@ class WalkForwardConfig:
                 "early_stopping_metric must be one of: "
                 + ", ".join(LightGBMModel.EARLY_STOPPING_METRICS)
             )
+        if not isinstance(self.workers, int) or self.workers < 1:
+            raise ValueError("workers must be a positive integer")
+        if self.threads_per_fit is not None and (
+            not isinstance(self.threads_per_fit, int) or self.threads_per_fit < 1
+        ):
+            raise ValueError("threads_per_fit must be a positive integer or None")
 
 
 @dataclass(frozen=True)
@@ -251,7 +291,7 @@ class LightGBMWalkForwardBacktester:
             )
 
         features["model_score"] = pd.NA
-        folds: list[WalkForwardFold] = []
+        specs: list[_FoldSpec] = []
         test_start_index = first_test_index
         fold_number = 1
         while test_start_index < len(dates):
@@ -286,98 +326,64 @@ class LightGBMWalkForwardBacktester:
                 fold_number += 1
                 continue
 
-            model = LightGBMModel(
-                feature_columns=list(
-                    feature_columns or self.feature_engine.MODEL_FEATURE_COLUMNS
-                )
-            )
-            artifact = model.fit(
-                train_rows,
-                artifact_dir=walkforward.artifact_dir,
-                min_training_rows=walkforward.min_training_rows,
-                validation_fraction=walkforward.validation_fraction,
-                min_validation_days=walkforward.min_validation_days,
-                validation_gap_days=walkforward.effective_validation_gap_days,
-                label_name=(
-                    "benchmark_excess_return"
-                    if label_mode == "benchmark_excess"
-                    else "cross_sectional_excess_return"
-                ),
-                early_stopping_rounds=walkforward.early_stopping_rounds,
-                early_stopping_metric=walkforward.early_stopping_metric,
-            )
-            scored = model.score(test_rows)
-            features.loc[test_mask, "model_score"] = scored["score"].to_numpy()
-            test_scores = test_rows[["symbol", "trade_date"]].copy()
-            test_scores["prediction"] = scored["score"].to_numpy()
-            test_labels = training[training["trade_date"].between(test_start, test_end)][
-                ["symbol", "trade_date", "label"]
-            ]
-            test_evaluation = test_scores.merge(
-                test_labels, on=["symbol", "trade_date"], how="inner"
-            )
-            fold_metrics = dict(artifact.metrics)
-            fold_metrics["test_labeled_rows"] = float(len(test_evaluation))
-            test_ic_values = (
-                LightGBMModel._daily_ic_values(
-                    test_evaluation, test_evaluation["prediction"]
-                )
-                if not test_evaluation.empty
-                else []
-            )
-            fold_metrics["test_ic_days"] = float(len(test_ic_values))
-            fold_metrics["test_ic_mean"] = (
-                float(sum(test_ic_values) / len(test_ic_values))
-                if test_ic_values
-                else 0.0
-            )
-            fold_metrics["model_degenerate"] = (
-                1.0 if artifact.health == LightGBMModel.HEALTH_DEGENERATE else 0.0
-            )
-            fold_metrics["test_top_bottom_spread"] = (
-                LightGBMModel._top_bottom_spread(
-                    test_evaluation, test_evaluation["prediction"]
-                )
-                if not test_evaluation.empty
-                else 0.0
-            )
-            # The quintile spread above is a much wider bucket than the book, so
-            # also measure the bucket that is actually traded.  Without it a
-            # losing strategy cannot be attributed to the model or to execution.
-            #
-            # Recorded only when the fold has a measurable bucket.  A fold whose
-            # test window falls entirely inside the label's forward-blind tail
-            # has no labels at all, and writing ``0.0`` for it would feed "not
-            # measured" into the aggregate as "measured, zero excess" -- quietly
-            # dragging every reported bucket mean toward zero.
-            if not test_evaluation.empty:
-                fold_metrics.update(
-                    {
-                        f"test_{key}": value
-                        for key, value in LightGBMModel._bucket_label_stats(
-                            test_evaluation,
-                            test_evaluation["prediction"],
-                            max_positions,
-                        ).items()
-                    }
-                )
-                fold_metrics["test_bucket_size"] = float(max_positions)
-            folds.append(
-                WalkForwardFold(
-                    fold=fold_number,
-                    train_start=train_start.isoformat(),
-                    train_end=train_end.isoformat(),
-                    test_start=test_start.isoformat(),
-                    test_end=test_end.isoformat(),
-                    training_rows=int(len(train_rows)),
-                    test_rows=int(len(test_rows)),
-                    model_version=artifact.model_version,
-                    metrics=fold_metrics,
-                    artifact_path=artifact.artifact_path,
+            specs.append(
+                _FoldSpec(
+                    fold_number=fold_number,
+                    train_rows=train_rows,
+                    test_rows=test_rows,
+                    test_mask=test_mask,
+                    train_start=train_start,
+                    train_end=train_end,
+                    test_start=test_start,
+                    test_end=test_end,
+                    test_labels=training.loc[
+                        training["trade_date"].between(test_start, test_end),
+                        ["symbol", "trade_date", "label"],
+                    ].copy(),
                 )
             )
             test_start_index += walkforward.step_days
             fold_number += 1
+
+        if not specs:
+            raise ValueError("walk-forward produced no trainable folds")
+
+        # Folds are independent (each trains on its own trailing window and
+        # scores a disjoint test window), so the fits go through a thread pool
+        # when ``workers > 1``: LightGBM's C++ trainer releases the GIL and
+        # each fit is pinned to a single LightGBM thread so concurrent fits
+        # share the machine instead of fighting for it.  Results are written
+        # back in fold order, so the output matches the sequential run.
+        if walkforward.workers > 1:
+            with ThreadPoolExecutor(max_workers=walkforward.workers) as pool:
+                fold_results = list(
+                    pool.map(
+                        lambda spec: self._fit_one_fold(
+                            spec,
+                            walkforward=walkforward,
+                            feature_columns=feature_columns,
+                            label_mode=label_mode,
+                            max_positions=max_positions,
+                        ),
+                        specs,
+                    )
+                )
+        else:
+            fold_results = [
+                self._fit_one_fold(
+                    spec,
+                    walkforward=walkforward,
+                    feature_columns=feature_columns,
+                    label_mode=label_mode,
+                    max_positions=max_positions,
+                )
+                for spec in specs
+            ]
+
+        folds: list[WalkForwardFold] = []
+        for spec, (fold, scored) in zip(specs, fold_results):
+            features.loc[spec.test_mask, "model_score"] = scored["score"].to_numpy()
+            folds.append(fold)
 
         if not folds:
             raise ValueError("walk-forward produced no trainable folds")
@@ -394,6 +400,112 @@ class LightGBMWalkForwardBacktester:
             last_evaluation_date=last_evaluation_date,
             labels=training[["symbol", "trade_date", "label"]],
         )
+
+    def _fit_one_fold(
+        self,
+        spec: "_FoldSpec",
+        *,
+        walkforward: WalkForwardConfig,
+        feature_columns: list[str] | None,
+        label_mode: str,
+        max_positions: int,
+    ) -> tuple[WalkForwardFold, pd.DataFrame]:
+        """Fit and score one fold; all inputs are fold-local copies.
+
+        Runs inside a worker thread when ``walkforward.workers > 1``.  It must
+        not touch shared frames -- only its own spec -- which is what makes the
+        pool safe.  The metric block is the historical fold body, unchanged.
+        """
+        train_rows = spec.train_rows
+        test_rows = spec.test_rows
+        model = LightGBMModel(
+            feature_columns=list(
+                feature_columns or self.feature_engine.MODEL_FEATURE_COLUMNS
+            ),
+            n_jobs=walkforward.threads_per_fit
+            if walkforward.threads_per_fit is not None
+            else (1 if walkforward.workers > 1 else None),
+        )
+        artifact = model.fit(
+            train_rows,
+            artifact_dir=walkforward.artifact_dir,
+            min_training_rows=walkforward.min_training_rows,
+            validation_fraction=walkforward.validation_fraction,
+            min_validation_days=walkforward.min_validation_days,
+            validation_gap_days=walkforward.effective_validation_gap_days,
+            label_name=(
+                "benchmark_excess_return"
+                if label_mode == "benchmark_excess"
+                else "cross_sectional_excess_return"
+            ),
+            early_stopping_rounds=walkforward.early_stopping_rounds,
+            early_stopping_metric=walkforward.early_stopping_metric,
+        )
+        scored = model.score(test_rows)
+        test_scores = test_rows[["symbol", "trade_date"]].copy()
+        test_scores["prediction"] = scored["score"].to_numpy()
+        test_evaluation = test_scores.merge(
+            spec.test_labels, on=["symbol", "trade_date"], how="inner"
+        )
+        fold_metrics = dict(artifact.metrics)
+        fold_metrics["test_labeled_rows"] = float(len(test_evaluation))
+        test_ic_values = (
+            LightGBMModel._daily_ic_values(
+                test_evaluation, test_evaluation["prediction"]
+            )
+            if not test_evaluation.empty
+            else []
+        )
+        fold_metrics["test_ic_days"] = float(len(test_ic_values))
+        fold_metrics["test_ic_mean"] = (
+            float(sum(test_ic_values) / len(test_ic_values))
+            if test_ic_values
+            else 0.0
+        )
+        fold_metrics["model_degenerate"] = (
+            1.0 if artifact.health == LightGBMModel.HEALTH_DEGENERATE else 0.0
+        )
+        fold_metrics["test_top_bottom_spread"] = (
+            LightGBMModel._top_bottom_spread(
+                test_evaluation, test_evaluation["prediction"]
+            )
+            if not test_evaluation.empty
+            else 0.0
+        )
+            # The quintile spread above is a much wider bucket than the book, so
+            # also measure the bucket that is actually traded.  Without it a
+            # losing strategy cannot be attributed to the model or to execution.
+            #
+            # Recorded only when the fold has a measurable bucket.  A fold whose
+            # test window falls entirely inside the label's forward-blind tail
+            # has no labels at all, and writing ``0.0`` for it would feed "not
+            # measured" into the aggregate as "measured, zero excess" -- quietly
+            # dragging every reported bucket mean toward zero.
+        if not test_evaluation.empty:
+            fold_metrics.update(
+                {
+                    f"test_{key}": value
+                    for key, value in LightGBMModel._bucket_label_stats(
+                        test_evaluation,
+                        test_evaluation["prediction"],
+                        max_positions,
+                    ).items()
+                }
+            )
+            fold_metrics["test_bucket_size"] = float(max_positions)
+        fold = WalkForwardFold(
+            fold=spec.fold_number,
+            train_start=spec.train_start.isoformat(),
+            train_end=spec.train_end.isoformat(),
+            test_start=spec.test_start.isoformat(),
+            test_end=spec.test_end.isoformat(),
+            training_rows=int(len(train_rows)),
+            test_rows=int(len(test_rows)),
+            model_version=artifact.model_version,
+            metrics=fold_metrics,
+            artifact_path=artifact.artifact_path,
+        )
+        return fold, scored
 
     def run(
         self,

@@ -103,8 +103,13 @@ class LightGBMModel:
     # reported as DEGENERATE instead of being silently scored as IC 0.
     MIN_UNIQUE_PREDICTIONS_PER_DAY = 2.0
 
-    def __init__(self, feature_columns: list[str] | None = None) -> None:
+    def __init__(
+        self, feature_columns: list[str] | None = None, *, n_jobs: int | None = None
+    ) -> None:
         self.feature_columns = list(feature_columns or FeatureEngine.FACTOR_COLUMNS)
+        # ``None`` keeps LightGBM's default (all cores).  Parallel walk-forward
+        # folds pass 1 so concurrent fits do not oversubscribe the machine.
+        self.n_jobs = n_jobs
         self.model: Any | None = None
         self.model_version = "untrained"
         self.artifact: ModelArtifact | None = None
@@ -208,6 +213,7 @@ class LightGBMModel:
         # unexplainable label noise and therefore stops after one tree.
         self.model = LGBMRegressor(
             metric="None" if early_stopping_metric == "rank_ic" else "l2",
+            **({} if self.n_jobs is None else {"n_jobs": self.n_jobs}),
             **tree_params,
         )
         fit_kwargs: dict[str, Any] = {}

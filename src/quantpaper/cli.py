@@ -146,6 +146,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     walkforward.add_argument("--market-root", default="data/eastmoney")
     walkforward.add_argument("--dataset", default="daily")
+    walkforward.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="并行拟合的 fold 数；1 为历史顺序行为。LightGBM 训练释放 GIL，"
+        "线程池在多 fold 时有效（每个 fit 自动钉在单线程）",
+    )
+    walkforward.add_argument(
+        "--threads-per-fit",
+        type=int,
+        default=None,
+        help="每个 LightGBM fit 的线程数；缺省按 workers 推导。显式指定可让"
+        "结果跨 worker 数逐位可复现",
+    )
     walkforward.add_argument("--train-days", type=int, default=504)
     walkforward.add_argument("--test-days", type=int, default=21)
     walkforward.add_argument("--step-days", type=int, default=21)
@@ -420,6 +434,8 @@ def main() -> None:
             early_stopping_metric=args.early_stopping_metric,
             score_smoothing_days=args.score_smoothing_days,
             artifact_dir=Path(app_config.model.artifact_dir) / "walkforward",
+            workers=args.workers,
+            threads_per_fit=args.threads_per_fit,
         )
         result = LightGBMWalkForwardBacktester(feature_engine=feature_engine).run(
             frame,
