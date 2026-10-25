@@ -1,6 +1,6 @@
 # A 股本地量化纸盘系统总计划
 
-最后更新：2026-09-15
+最后更新：2026-09-16
 
 ## 1. 项目目标
 
@@ -109,7 +109,7 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\scripts\close_qua
 训练和回测前检查：
 
 1. 交易日期、股票代码和 `(symbol, trade_date)` 唯一性；
-2. OHLCV、成交额和复权方式；
+2. OHLCV、成交额和统一复权方式；
 3. 停牌、ST、新股、退市和涨跌停状态；
 4. 行业、板块和股票池覆盖；
 5. 财务公告日期必须早于或等于使用日期；
@@ -119,9 +119,17 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\scripts\close_qua
 
 当前补齐状态：代码和 SDK 均已具备市值接口，行业接口也已接入只读桥接，但小范围探针在量化终端关闭时返回“无法连接到终端服务”。因此暂不打开行业全量请求，也不覆盖现有 Parquet；必须在交易时段终端服务正常后先通过探针，再做新缓存同步。历史行业分类不能用当前分类倒填过去，必须按 `as_of` 日期做点时合并。
 
+全量历史归档已拿到，但审计发现东方财富股票主表返回的 5,672 个代码中含有 B 股；当前代码已把研究范围收紧到 5,557 个目标沪深 A 股代码，并保留 300/301/302、688/689。旧 `data/eastmoney` 日线还没有复权标记，且存在除权跳变，不能直接训练收益标签。同步脚本现在默认请求 `ADJUST_PREV`，并把复权方式写入日线和 manifest；研究命令对未知或混合复权数据直接报错。应在新目录 `data/eastmoney_adjusted` 完成一次全量同步后再训练。
+
+可用 `scripts/audit_eastmoney_archive.py` 重复检查归档；当前旧归档审计为 `DEGRADED`，不是因为行数不足，而是因为复权来源未知且存在异常跳变。
+
+2026-09-17 更新：`data/eastmoney_adjusted` 已完成 2023-01-01 至 2026-09-16 的 5,559 只股票归档，其中 5,366 只在窗口内有日线，共 4,583,161 行；复权方式统一为 `ADJUST_PREV`。原始归档中的 87 个异常跳变已由 `scripts/build_research_quality.py` 生成事件清单，研究视图排除 1,675 行并重置事件后的滚动窗口。原始状态仍显示 `DEGRADED` 以保留警告，研究视图显示 `READY`，不删除原始数据。
+
 股票池分层：研究日线默认 `research_universe_limit = 0`（不在 Provider 层截断），盘中默认 `realtime_universe_limit = 500`；每日模型评分后，Runner 只把前 500 名候选和当前持仓加入实时行情列表。基础面接口仍先按 `fundamentals_universe_limit = 500` 分阶段同步，避免东方财富逐股票接口把全量历史任务拖成长时间阻塞。
 
 任何关键检查失败，结果标记 `DEGRADED`，不生成看似正常的调仓结果。
+
+当前全量研究结果已落盘：M0 等权因子回测总收益 -16.71%、Sharpe -0.75、最大回撤 -20.37%；19 折 M1 LightGBM walk-forward 总收益 4.00%、Sharpe 0.48、最大回撤 -7.44%，测试 IC 均值 0.068。M1 候选 artifact 仍未晋级纸盘，原因是行业历史覆盖为 0，且需要继续做中性化、成本敏感性和纸盘影子验证。
 
 ## 5. 回测路线
 
@@ -415,6 +423,28 @@ LightGBM Walk-forward 回测报告：
 这些结果只证明回测链路和时间切分已经运行，不构成策略晋级结论。当前历史缓存没有 PE、PB、ROE、利润增速等财务字段，模型报告中的 `factor_coverage_mean` 为 0.0。因此在 S5 之前不能把当前模型作为基本面完整版本，也不能据此宣称可进入真实纸盘。
 
 ## 13. 当前验收命令
+
+### 13.1 指数基准与分段回测
+
+已通过东方财富只读历史接口单独归档 5 条指数日线：上证指数、深证成指、沪深 300、
+创业板指和中证 500。文件为 `data/eastmoney_adjusted/benchmarks.parquet`，共 8,135
+行，覆盖 2020-01-02 至 2026-09-16；指数的 `000001` 与股票日线中的平安银行代码
+严格分开保存。
+
+新增 `period-backtest` 命令支持多个 `name:start:end` 区间。每段回测自动读取 120 个
+交易日因子预热数据，只统计指定区间，并分别报告策略收益、基准收益和超额收益。当前
+默认分段报告为 `data/reports/period-backtest-default.json`，包含 2024、2025 和
+2026 年至今的沪深 300 对比结果。2024 和 2025 的 11 因子透明基线明显跑输沪深 300，
+2026 年至今仍为负但相对大盘约少 2.78 个百分点；这只是分段诊断，不是模型晋级结论。
+
+随后已完成相对沪深 300 标签的候选 LightGBM 训练和分段 walk-forward。候选 artifact 为
+`data/models/research/factor-lgbm-b2f04f320e.pkl`，报告为
+`data/reports/benchmark-excess-model.json` 和
+`data/reports/benchmark-excess-walkforward.json`。2024、2025、2026 年至今的超额收益
+分别为 -19.53%、-23.38% 和 -2.65%，候选模型仍保持 `NOT_PROMOTED`。
+
+下一步不是继续盲目增加模型复杂度，而是做成本敏感性、调仓频率、股票池稳定性和标签
+一致性诊断；只有在相同区间下超额收益改善并通过纸盘影子验证，才考虑接入候选信号。
 
 代码回归：
 

@@ -43,6 +43,21 @@ class RiskEngine:
             events.append(self._event("MEDIUM", "ORDER_LIMIT", "待处理订单超过人工操作上限", now))
         if len(positions) > self.portfolio.max_positions:
             events.append(self._event("MEDIUM", "POSITION_COUNT", "持仓数量超过组合上限", now))
+        # The symmetric floor.  ``min_positions`` went unread for its entire
+        # life, so a book that collapsed back to a handful of names looked
+        # exactly like a book that was simply being prudent -- the failure the
+        # floor exists to name.  A book with no positions at all is a separate
+        # state (nothing built yet, or fully liquidated) and is not reported
+        # here, or every session would open with a spurious event.
+        if 0 < len(positions) < self.portfolio.min_positions:
+            events.append(
+                self._event(
+                    "MEDIUM",
+                    "POSITION_COUNT_FLOOR",
+                    f"持仓数量 {len(positions)} 低于组合下限 {self.portfolio.min_positions}",
+                    now,
+                )
+            )
         return events
 
     @staticmethod

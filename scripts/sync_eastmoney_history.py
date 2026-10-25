@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pandas as pd
 
+from quantpaper.domain import is_target_a_share_symbol
 from quantpaper.eastmoney import EastmoneyBridgeClient
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -39,6 +40,11 @@ BAR_FIELDS = [
     "eob",
 ]
 FUNDAMENTALS_NORMALIZATION_VERSION = 2
+PRICE_ADJUSTMENT_MODES = {
+    "none": (0, "ADJUST_NONE"),
+    "prev": (1, "ADJUST_PREV"),
+    "post": (2, "ADJUST_POST"),
+}
 
 
 def now_iso() -> str:
@@ -87,21 +93,26 @@ def compact_parquet(
     temporary = output.with_suffix(output.suffix + ".tmp")
     connection = duckdb.connect()
     try:
-        connection.execute(
-            "CREATE TEMP TABLE compact_source AS SELECT * FROM read_parquet(?)",
-            [source_glob],
-        )
-        result = connection.execute("SELECT COUNT(*) FROM compact_source").fetchone()
+        result = connection.execute(
+            "SELECT COUNT(*) FROM read_parquet(?)", [source_glob]
+        ).fetchone()
         rows = int(result[0]) if result else 0
         if rows:
             columns = set(
                 row[0]
-                for row in connection.execute("DESCRIBE compact_source").fetchall()
+                for row in connection.execute(
+                    "DESCRIBE SELECT * FROM read_parquet(?)", [source_glob]
+                ).fetchall()
             )
             order_by = [column for column in order_columns if column in columns]
             order_sql = f" ORDER BY {', '.join(order_by)}" if order_by else ""
+            # DuckDB supports a parameter for the output path but not for the
+            # input glob inside COPY on all bundled versions.  The glob is
+            # generated internally by this script; quote it explicitly while
+            # escaping single quotes so user input cannot become SQL.
+            escaped_glob = source_glob.replace("'", "''")
             connection.execute(
-                f"COPY (SELECT * FROM compact_source{order_sql}) "
+                f"COPY (SELECT * FROM read_parquet('{escaped_glob}'){order_sql}) "
                 "TO ? (FORMAT PARQUET, COMPRESSION ZSTD)",
                 [str(temporary)],
             )
@@ -144,13 +155,18 @@ def normalise_instruments(rows: list[dict[str, Any]]) -> pd.DataFrame:
         raise RuntimeError("东方财富股票主表为空")
     frame["vendor_symbol"] = frame["symbol"].map(vendor_symbol)
     frame["symbol"] = frame["symbol"].map(code_from_symbol)
+    frame = frame[frame["symbol"].map(is_target_a_share_symbol)].copy()
+    if frame.empty:
+        raise RuntimeError("东方财富股票主表中没有目标沪深 A 股")
     frame["exchange"] = frame["vendor_symbol"].map(exchange_from_symbol)
     if "listed_date" in frame:
         frame["listed_date"] = pd.to_datetime(frame["listed_date"], errors="coerce")
     return frame.sort_values("symbol").drop_duplicates("symbol").reset_index(drop=True)
 
 
-def normalise_bars(rows: list[dict[str, Any]], symbol: str) -> pd.DataFrame:
+def normalise_bars(
+    rows: list[dict[str, Any]], symbol: str, price_adjustment: str = "UNKNOWN"
+) -> pd.DataFrame:
     frame = pd.DataFrame(rows)
     if frame.empty:
         return frame
@@ -164,6 +180,7 @@ def normalise_bars(rows: list[dict[str, Any]], symbol: str) -> pd.DataFrame:
     frame["symbol"] = frame["symbol"].map(code_from_symbol)
     frame["exchange"] = frame["vendor_symbol"].map(exchange_from_symbol)
     frame["frequency"] = "1d"
+    frame["price_adjustment"] = price_adjustment
     for column in ("open", "high", "low", "close", "volume", "amount", "pre_close"):
         if column not in frame:
             frame[column] = pd.NA
@@ -292,6 +309,10 @@ def fetch_metadata(
     manifest["universe"] = {
         "count": int(len(frame)),
         "path": str((root / "instrument_master.parquet").resolve()),
+        "scope": (
+            "SHSE/SZSE A-share stock codes "
+            "(000/001/002/003/300/301/302/600/601/603/605/688/689)"
+        ),
         "includes_suspended": True,
         "includes_st": True,
         "updated_at": now_iso(),
@@ -352,6 +373,25 @@ def retry_request(
     raise last_error
 
 
+def recycle_bridge_if_needed(
+    client: EastmoneyBridgeClient,
+    processed_since_restart: int,
+    restart_every: int,
+    *,
+    dataset: str,
+) -> int:
+    """Bound the lifetime of the vendor SDK process during long downloads."""
+
+    if restart_every <= 0 or processed_since_restart < restart_every:
+        return processed_since_restart
+    print(
+        f"[bridge] recycle after {processed_since_restart} {dataset} symbols",
+        flush=True,
+    )
+    client.restart()
+    return 0
+
+
 def download_daily(
     client: EastmoneyBridgeClient,
     manifest: dict[str, Any],
@@ -363,8 +403,23 @@ def download_daily(
     retries: int,
     sleep_seconds: float,
     max_symbols: int,
+    adjust_mode: str,
+    bridge_restart_every: int,
 ) -> None:
     state = dataset_state(manifest, "daily_bars")
+    try:
+        adjust_code, adjustment_label = PRICE_ADJUSTMENT_MODES[adjust_mode]
+    except KeyError as exc:
+        raise ValueError(f"unsupported price adjustment mode: {adjust_mode}") from exc
+    existing_adjustment = state.get("price_adjustment")
+    if state.get("completed_symbols") and existing_adjustment != adjustment_label:
+        raise RuntimeError(
+            "现有日线归档没有相同的复权来源，不能混合续传；请使用新的 --root "
+            "（推荐 data/eastmoney_adjusted）重新下载"
+        )
+    state["price_adjustment"] = adjustment_label
+    state["adjust_enum"] = adjust_code
+    state["adjust_end_time"] = end.isoformat()
     completed = set(state["completed_symbols"])
     failed = state["failed_symbols"]
     selected = records[:max_symbols] if max_symbols else records
@@ -372,13 +427,30 @@ def download_daily(
     output_dir.mkdir(parents=True, exist_ok=True)
     total = len(selected)
     consecutive_failures = 0
+    processed_since_restart = 0
     for index, record in enumerate(selected, start=1):
         symbol = code_from_symbol(record["symbol"])
         part = output_dir / part_name(record)
         if symbol in completed and (part.exists() or state.get("empty_symbols", {}).get(symbol)):
             continue
+        symbol_start = listed_start(record, start)
+        if symbol_start > end:
+            # The current instrument master can contain an IPO that was
+            # listed after the historical cutoff.  Do not send an invalid
+            # start-after-end request to the vendor; checkpoint it as empty
+            # for this archive window and continue.
+            state.setdefault("empty_symbols", {})[symbol] = True
+            completed.add(symbol)
+            failed.pop(symbol, None)
+            if index % 10 == 0 or index == total:
+                state["completed_symbols"] = sorted(completed)
+                save_manifest(manifest_path, manifest)
+                print(
+                    f"[daily {index}/{total}] completed={len(completed)} failed={len(failed)}",
+                    flush=True,
+                )
+            continue
         try:
-            symbol_start = listed_start(record, start)
             rows = retry_request(
                 client,
                 "history",
@@ -389,11 +461,15 @@ def download_daily(
                     "end_time": end.isoformat(),
                     "fields": BAR_FIELDS,
                     "skip_suspended": False,
+                    "adjust": adjust_code,
+                    "adjust_end_time": end.isoformat(),
                 },
                 retries,
                 sleep_seconds,
             ) or []
-            frame = normalise_bars(rows, record["vendor_symbol"])
+            frame = normalise_bars(
+                rows, record["vendor_symbol"], price_adjustment=adjustment_label
+            )
             if not frame.empty:
                 write_parquet(frame, part)
                 state["rows"] = int(state.get("rows", 0)) + len(frame)
@@ -419,6 +495,13 @@ def download_daily(
                 raise RuntimeError(
                     "连续 5 个股票无法访问东方财富接口，已暂停以等待终端恢复"
                 ) from exc
+        processed_since_restart += 1
+        processed_since_restart = recycle_bridge_if_needed(
+            client,
+            processed_since_restart,
+            bridge_restart_every,
+            dataset="daily",
+        )
         if index % 10 == 0 or index == total:
             state["completed_symbols"] = sorted(completed)
             save_manifest(manifest_path, manifest)
@@ -446,6 +529,7 @@ def download_fundamentals(
     sleep_seconds: float,
     max_symbols: int,
     industry_enabled: bool,
+    bridge_restart_every: int,
 ) -> None:
     state = dataset_state(manifest, "fundamentals")
     if state.get("normalization_version") != FUNDAMENTALS_NORMALIZATION_VERSION:
@@ -481,6 +565,7 @@ def download_fundamentals(
         (root / directory).mkdir(parents=True, exist_ok=True)
 
     consecutive_failures = 0
+    processed_since_restart = 0
     for index, record in enumerate(selected, start=1):
         symbol = code_from_symbol(record["symbol"])
         stem = Path(part_name(record)).stem
@@ -548,6 +633,13 @@ def download_fundamentals(
                 raise RuntimeError(
                     "连续 5 个股票无法访问东方财富基础面接口，已暂停以等待终端恢复"
                 ) from exc
+        processed_since_restart += 1
+        processed_since_restart = recycle_bridge_if_needed(
+            client,
+            processed_since_restart,
+            bridge_restart_every,
+            dataset="fundamentals",
+        )
         if index % 10 == 0 or index == total:
             state["completed_symbols"] = sorted(completed)
             save_manifest(manifest_path, manifest)
@@ -618,6 +710,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sleep-seconds", type=float, default=0.05)
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     parser.add_argument(
+        "--bridge-restart-every",
+        type=int,
+        default=200,
+        help="每处理多少只股票回收一次东方财富 SDK 桥接进程；0 表示不回收",
+    )
+    parser.add_argument(
+        "--adjust",
+        choices=tuple(PRICE_ADJUSTMENT_MODES),
+        default="prev",
+        help="日线复权方式；prev=前复权（研究推荐），post=后复权，none=不复权",
+    )
+    parser.add_argument(
         "--industry",
         action="store_true",
         help="额外尝试行业接口；无权限时会记录错误",
@@ -630,8 +734,16 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.start > args.end:
         raise SystemExit("--start 不能晚于 --end")
-    if args.max_symbols < 0 or args.retries < 1 or args.sleep_seconds < 0:
-        raise SystemExit("--max-symbols、--retries 和 --sleep-seconds 参数无效")
+    if (
+        args.max_symbols < 0
+        or args.retries < 1
+        or args.sleep_seconds < 0
+        or args.bridge_restart_every < 0
+    ):
+        raise SystemExit(
+            "--max-symbols、--retries、--sleep-seconds 和 "
+            "--bridge-restart-every 参数无效"
+        )
 
     root = Path(args.root)
     manifest_path = root / "manifest.json"
@@ -662,6 +774,8 @@ def main() -> int:
                 args.retries,
                 args.sleep_seconds,
                 args.max_symbols,
+                args.adjust,
+                args.bridge_restart_every,
             )
         if args.dataset in {"fundamentals", "all"}:
             download_fundamentals(
@@ -676,6 +790,7 @@ def main() -> int:
                 args.sleep_seconds,
                 args.max_symbols,
                 args.industry,
+                args.bridge_restart_every,
             )
         compact_archive(root, manifest)
         save_manifest(manifest_path, manifest)

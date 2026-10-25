@@ -29,6 +29,7 @@
 - 订单有完整状态链路：草稿、确认、提交、部分成交、成交、拒绝、撤销、过期。
 - API 返回的历史日线可以经过质量检查后落盘为 Parquet，并用 DuckDB 按日期和股票读取。
 - 因子研究回测严格采用“日 T 收盘生成信号，日 T+1 开盘模拟成交”，输出 JSON 和权益曲线 CSV。
+- 指数基准历史单独归档，回测可按任意起止日期批量输出策略收益、基准收益和超额收益。
 
 股票价格和研究因子不从 CSV 导入。当前默认数据源为东方财富掘金的只读 API；数据源不可用或基础面因子接口不完整时，系统会显示 `UNAVAILABLE`/`STALE` 与具体原因，不会退回演示数据，也不会继续生成看似正常的开盘调仓。
 
@@ -194,15 +195,112 @@ python -m quantpaper.cli backtest --source store --dataset daily
 如需把东方财富量化客户端当前账号能访问的历史数据完整归档到本地，使用：
 
 ```powershell
-python .\scripts\sync_eastmoney_history.py --dataset all --root data\eastmoney
+python .\scripts\sync_eastmoney_history.py --dataset all `
+  --root data\eastmoney_adjusted --start 2023-01-01 --adjust prev
 ```
 
 归档脚本会保存当前股票主表、交易日历、各股票上市以来的日线，以及有权限的
 历史估值、市值、换手和财务衍生字段。每只股票单独保存为压缩 Parquet，并写入
-`data/eastmoney/manifest.json`，可中断后重复执行继续下载。归档数据先保持在
+`data/eastmoney_adjusted/manifest.json`，可中断后重复执行继续下载。归档数据先保持在
 独立目录，不会自动覆盖当前纸盘使用的 `data/market/daily.parquet`；完成质量检查
 后再决定是否切换研究数据源。行业分类接口若账号没有权限，会记录为不可用，
 不会用当前分类回填历史。
+
+研究训练还有两个硬门禁：研究只接受目标范围的沪深 A 股代码（包含 300/301/302 和
+688/689，排除 B 股、基金、指数等），并且日线必须带统一的复权标记。此前已经
+下载到 `data/eastmoney` 的旧归档没有复权标记，抽查发现除权处存在异常价格跳变，
+因此代码不会把它直接用于标签、因子或模型训练。旧归档保留作审计，不会被覆盖。
+原始归档即使发现异常跳变也不会被删除；先生成质量事件清单，研究命令再读取隔离后的研究视图：
+
+```powershell
+python .\scripts\audit_eastmoney_archive.py --root data\eastmoney
+python .\scripts\build_research_quality.py `
+  --root data\eastmoney_adjusted `
+  --report data\reports\research-quality-adjusted.json
+```
+
+需要建立可训练的全量归档时，在东方财富量化终端可用的时段执行：
+
+```powershell
+python .\scripts\sync_eastmoney_history.py --dataset all `
+  --root data\eastmoney_adjusted --start 2023-01-01 --adjust prev
+```
+
+`--adjust prev` 是研究默认的前复权方式；脚本会把复权方式写入每条日线和
+`manifest.json`，续传时禁止混合不同复权方式。之后的全量研究命令使用：
+
+```powershell
+python -m quantpaper.cli factor-research --source store `
+  --market-root data/eastmoney_adjusted --quality-policy exclude
+python -m quantpaper.cli walkforward --source store `
+  --market-root data/eastmoney_adjusted --quality-policy exclude
+```
+
+### 指数基准和多区间回测
+
+指数不混入股票日线池。使用东方财富只读历史接口单独下载上证指数、深证成指、
+沪深 300、创业板指和中证 500：
+
+```powershell
+python .\scripts\sync_eastmoney_benchmarks.py `
+  --root data/eastmoney_adjusted --start 2020-01-01 --end 2026-09-17
+```
+
+批量回测默认按年度切分 2024、2025 和 2026 年至今；每个区间会额外
+向前读取 120 个交易日用于因子预热，但只统计指定区间内的交易。报告中会分别保存
+`total_return`、`benchmark_return` 和 `excess_return`：
+
+```powershell
+python -m quantpaper.cli period-backtest `
+  --market-root data/eastmoney_adjusted `
+  --output data/reports/period-backtest.json
+```
+
+也可以自行指定多个区间，格式为 `名称:开始日期:结束日期`：
+
+```powershell
+python -m quantpaper.cli period-backtest `
+  --market-root data/eastmoney_adjusted `
+  --benchmark 000300 `
+  --period bear:2022-01-01:2022-12-31 `
+  --period rebound:2023-01-01:2023-12-31 `
+  --period recent:2025-01-01:2026-09-16
+```
+
+`000300` 是沪深 300；可替换为 `000001`、`399001`、`399006` 或 `000905`。指数文件
+为 `data/eastmoney_adjusted/benchmarks.parquet`，股票代码相同但含义不同，读取时不会
+和股票 `daily.parquet` 混淆。该回测仍是研究和纸盘验证，不构成收益承诺。
+
+这意味着“5000 多只股票都用于训练”是可以的，但必须使用这个经过 A 股筛选、复权
+标记和质量事件隔离的数据版本；`candidate_pool_size = 500` 只限制盘中候选和组合构建，
+不限制历史训练样本。
+
+截至 2026-09-16 的全量归档包含 4,583,161 行日线、5,366 只股票。审计发现 87 个
+绝对收益超过 30% 的事件，研究视图隔离 1,675 行，原始归档仍保留。可复现地训练
+一份未晋级的全量 LightGBM 候选：
+
+```powershell
+python .\scripts\train_from_eastmoney_archive.py `
+  --market-root data\eastmoney_adjusted `
+  --train-end 2026-09-16 `
+  --artifact-dir data\models\research `
+  --output data\reports\full-universe-adjusted-model.json
+```
+
+当前候选模型和滚动回测只作为研究证据，不会自动替换纸盘正在使用的模型。
+
+相对沪深 300 的候选训练和分段验证：
+
+```powershell
+python .\scripts\train_benchmark_excess_model.py `
+  --market-root data/eastmoney_adjusted `
+  --benchmark-symbol 000300
+python .\scripts\walkforward_benchmark_excess.py `
+  --market-root data/eastmoney_adjusted `
+  --benchmark-symbol 000300
+```
+
+这两个命令只写入 `data/models/research` 和 `data/reports`，不会替换纸盘模型。
 
 只有在测试撮合引擎时才使用确定性演示数据：
 

@@ -3,19 +3,42 @@ name = "safe_paper"
 initial_capital = 1000000.0
 max_gross_exposure = 1.0
 cash_floor = 0.10
-margin_enabled = true
+# Off, and honestly so: every instrument the live provider builds is
+# marginable = False (instrument_master.margin_ratio is not proof that *this*
+# account can borrow), so with this on the broker would advertise a capability
+# it can never exercise.  The report states the marginable count either way.
+margin_enabled = false
 maintenance_ratio_warning = 1.30
 maintenance_ratio_liquidation = 1.10
-initial_margin_ratio = 0.50
 
 [portfolio]
+# Risk floor, not a construction target: the engine still takes the best
+# `max_positions` names, and the RiskEngine raises POSITION_COUNT_FLOOR when a
+# live book sits below this.  0 disables the floor (which is why the dataclass
+# default is 0 -- research profiles deliberately run 6-name books).  The live
+# account is the one that needs a real floor.
 min_positions = 20
 max_positions = 30
 candidate_pool_size = 500
 single_weight_cap = 0.08
 industry_weight_cap = 0.25
-max_daily_turnover = 0.15
-max_daily_action_orders = 10
+# Cap on TWO-SIDED traded notional per rebalance, as a share of equity
+# ((buys + sells) / equity).  The portfolio is held fully invested at all times;
+# this only limits how much of the book may rotate.  Each leg therefore gets half
+# the cap (10%), so realised one-sided turnover (单边换手) stays in the 10%-20%
+# band.  The session that funds the book from all-cash to target exposure is a
+# deployment, not a rotation, and is exempt.
+max_daily_turnover = 0.20
+# Must be >= max_positions.  A 30-name book cannot even be topped up to target
+# weights (let alone maintained) at ten orders a day: the shortfall shows up as
+# permanently under-invested positions.  The real risk control is
+# max_daily_turnover; this is only an execution-capacity brake.
+max_daily_action_orders = 40
+# Re-rank every N trading days.  Matched to the 5-day label horizon: re-ranking
+# more often than the signal horizon is over-trading by construction.
+# Research-backtest only. 1 / 0.0 reproduce the original daily top-N behaviour.
+rebalance_every_n_days = 5
+hold_buffer_ratio = 0.0
 
 [execution]
 mode = "paper_auto"
@@ -26,6 +49,9 @@ order_reissue_cooldown_seconds = 300
 session_rebalance_enabled = true
 session_rebalance = "PM_OPEN"
 session_rebalance_window_minutes = 15
+session_rebalance_retry_seconds = 60
+close_report_enabled = true
+close_report_time = "15:05"
 max_participation_pct = 0.10
 slippage_bps = 5.0
 commission_rate = 0.0003
@@ -40,6 +66,7 @@ retrain_weekday = 4
 min_training_rows = 500
 validation_fraction = 0.20
 min_validation_days = 20
+validation_gap_days = 5
 artifact_dir = "data/models"
 walkforward_report_path = "data/reports/lightgbm-walkforward-3y.json"
 auto_retrain = true
@@ -49,7 +76,6 @@ mode = "live"
 historical_provider = "eastmoney"
 realtime_provider = "eastmoney"
 universe = ""
-intraday_interval = "1m"
 stale_after_seconds = 180
 history_lookback_days = 780
 research_universe_limit = 0

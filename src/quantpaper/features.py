@@ -51,6 +51,31 @@ class FeatureEngine:
     FACTOR_COLUMNS = BASELINE_FACTOR_COLUMNS
     RESEARCH_FACTOR_COLUMNS = BASELINE_FACTOR_COLUMNS + F1_FACTOR_COLUMNS
 
+    # Candidate profile for the next research iteration.  These are the
+    # factors that were positive or at least non-negative in the first
+    # full-universe screen.  The existing production baseline remains
+    # unchanged; this profile is only selected explicitly by research code.
+    CANDIDATE_FACTOR_COLUMNS = [
+        "reversal_5",
+        "volatility_20",
+        "value_score",
+        "quality_score",
+        "growth_score",
+        "size_score",
+        "atr_20",
+        "gap_1",
+        "amount_stability_20",
+        "beta_60",
+    ]
+
+    BENCHMARK_FEATURE_COLUMNS = [
+        "benchmark_return_5",
+        "benchmark_return_20",
+        "benchmark_return_60",
+        "benchmark_volatility_20",
+        "benchmark_drawdown_60",
+    ]
+
     FACTOR_METADATA = {
         "momentum_5": {
             "name": "5日动量",
@@ -175,7 +200,68 @@ class FeatureEngine:
         "size_data_available",
     ]
 
-    def build_features(self, daily_frame: pd.DataFrame) -> pd.DataFrame:
+    # The transparent factor baseline remains eleven columns.  The local
+    # model receives a small set of explicit availability channels as well,
+    # so a neutral 0.5 placeholder cannot be mistaken for a real valuation or
+    # financial observation.  This preserves the baseline schema for old
+    # artifacts while giving new artifacts enough information to down-weight
+    # incomplete data.
+    MODEL_FEATURE_COLUMNS = BASELINE_FACTOR_COLUMNS + [
+        *COVERAGE_COLUMNS,
+        "fundamental_coverage",
+    ]
+
+    CANDIDATE_MODEL_FEATURE_COLUMNS = CANDIDATE_FACTOR_COLUMNS + [
+        *COVERAGE_COLUMNS,
+        "fundamental_coverage",
+        *BENCHMARK_FEATURE_COLUMNS,
+    ]
+
+    # Candidate profile v3.  Same selected factors as v2, but the market-regime
+    # columns are removed from the ranking model.  ``benchmark_return_5/20/60``,
+    # ``benchmark_volatility_20`` and ``benchmark_drawdown_60`` are identical for
+    # every stock on a given date, so they cannot rank one stock against another.
+    # Keeping them let the model fit the date-level component of the
+    # benchmark-excess label first and then stop, which produced one identical
+    # score per trading date and zero stock-selection content.  They stay
+    # available for a separate exposure or timing layer -- just not inside the
+    # cross-sectional ranking model.
+    #
+    # ``size_data_available`` is dropped for the same reason: the archived
+    # market-capitalisation field is populated for essentially every research
+    # row, so the flag is constant and can never inform a split.  It still
+    # contributes to ``fundamental_coverage``.
+    CROSS_SECTIONAL_MODEL_FEATURE_COLUMNS = CANDIDATE_FACTOR_COLUMNS + [
+        "value_data_available",
+        "quality_data_available",
+        "growth_data_available",
+        "fundamental_coverage",
+    ]
+
+    FEATURE_PROFILES: dict[str, list[str]] = {
+        "baseline-v1": MODEL_FEATURE_COLUMNS,
+        "candidate-v2": CANDIDATE_MODEL_FEATURE_COLUMNS,
+        "candidate-v3": CROSS_SECTIONAL_MODEL_FEATURE_COLUMNS,
+    }
+
+    @classmethod
+    def feature_profile(cls, name: str) -> list[str]:
+        """Return the feature columns for a named research profile."""
+
+        if name not in cls.FEATURE_PROFILES:
+            raise ValueError(
+                f"unknown feature profile: {name}; available: "
+                + ", ".join(sorted(cls.FEATURE_PROFILES))
+            )
+        return list(cls.FEATURE_PROFILES[name])
+
+    def build_features(
+        self,
+        daily_frame: pd.DataFrame,
+        *,
+        benchmark_frame: pd.DataFrame | None = None,
+        benchmark_symbol: str = "000300",
+    ) -> pd.DataFrame:
         required = {"symbol", "trade_date", "close", "amount"}
         missing = required - set(daily_frame.columns)
         if missing:
@@ -184,7 +270,11 @@ class FeatureEngine:
         frame["trade_date"] = pd.to_datetime(frame["trade_date"])
         frame = frame.sort_values(["symbol", "trade_date"]).reset_index(drop=True)
         self.validate_point_in_time(frame)
-        group = frame.groupby("symbol", group_keys=False)
+        # A research quality event creates a new history segment after its
+        # excluded window.  Ordinary/live data has no hidden segment column
+        # and therefore keeps the original per-symbol grouping.
+        feature_group = frame.get("_feature_group", frame["symbol"])
+        group = frame.groupby(feature_group, group_keys=False)
         frame["momentum_5"] = group["close"].pct_change(5)
         frame["momentum_20"] = group["close"].pct_change(20)
         frame["momentum_60"] = group["close"].pct_change(60)
@@ -202,7 +292,7 @@ class FeatureEngine:
         turnover = self._first_available(frame, ("turnover_rate", "turnover"))
         turnover_available = turnover.notna() & (turnover > 0)
         amount_roll = group["amount"].transform(lambda series: series.rolling(20).mean())
-        turnover_roll = turnover.groupby(frame["symbol"], group_keys=False).transform(
+        turnover_roll = turnover.groupby(feature_group, group_keys=False).transform(
             lambda series: series.rolling(20).mean()
         )
         frame["turnover_20"] = turnover_roll.where(
@@ -250,7 +340,7 @@ class FeatureEngine:
         # trailing windows, so they remain point-in-time when the frame is
         # truncated at any historical date.
         close = self._numeric(frame.get("close"), frame.index)
-        previous_close = close.groupby(frame["symbol"], group_keys=False).shift(1)
+        previous_close = close.groupby(feature_group, group_keys=False).shift(1)
         open_price = self._numeric(frame.get("open"), frame.index)
         high = self._numeric(frame.get("high"), frame.index)
         low = self._numeric(frame.get("low"), frame.index)
@@ -258,7 +348,7 @@ class FeatureEngine:
             [high - low, (high - previous_close).abs(), (low - previous_close).abs()],
             axis=1,
         ).max(axis=1, skipna=True)
-        atr = true_range.groupby(frame["symbol"], group_keys=False).transform(
+        atr = true_range.groupby(feature_group, group_keys=False).transform(
             lambda series: series.rolling(20).mean()
         )
         frame["atr_20"] = -(atr / close)
@@ -266,10 +356,10 @@ class FeatureEngine:
         overnight_gap = (open_price / previous_close) - 1
         frame["gap_1"] = -overnight_gap.abs()
 
-        rolling_high = high.groupby(frame["symbol"], group_keys=False).transform(
+        rolling_high = high.groupby(feature_group, group_keys=False).transform(
             lambda series: series.rolling(20).max()
         )
-        rolling_low = low.groupby(frame["symbol"], group_keys=False).transform(
+        rolling_low = low.groupby(feature_group, group_keys=False).transform(
             lambda series: series.rolling(20).min()
         )
         price_range = (rolling_high - rolling_low).replace(0, np.nan)
@@ -278,7 +368,7 @@ class FeatureEngine:
         volume = self._numeric(frame.get("volume"), frame.index)
         volume_fallback = frame["amount"] / close.replace(0, np.nan)
         volume = volume.where(volume.notna() & (volume > 0), volume_fallback)
-        volume_group = volume.groupby(frame["symbol"], group_keys=False)
+        volume_group = volume.groupby(feature_group, group_keys=False)
         volume_short = volume_group.transform(lambda series: series.rolling(5).mean())
         volume_long = volume_group.transform(lambda series: series.rolling(20).mean())
         frame["volume_trend_20"] = (volume_short / volume_long) - 1
@@ -287,7 +377,7 @@ class FeatureEngine:
         amount_std = group["amount"].transform(lambda series: series.rolling(20).std())
         frame["amount_stability_20"] = -(amount_std / amount_mean)
 
-        daily_return = close.groupby(frame["symbol"], group_keys=False).pct_change()
+        daily_return = close.groupby(feature_group, group_keys=False).pct_change()
         frame["_f1_daily_return"] = daily_return
         market_return = frame.groupby("trade_date")["_f1_daily_return"].transform("mean")
         frame["_f1_market_return"] = market_return
@@ -299,17 +389,17 @@ class FeatureEngine:
             market_momentum
         )
 
-        asset_mean = daily_return.groupby(frame["symbol"], group_keys=False).transform(
+        asset_mean = daily_return.groupby(feature_group, group_keys=False).transform(
             lambda series: series.rolling(60).mean()
         )
-        market_mean = market_return.groupby(frame["symbol"], group_keys=False).transform(
+        market_mean = market_return.groupby(feature_group, group_keys=False).transform(
             lambda series: series.rolling(60).mean()
         )
         cross_mean = (daily_return * market_return).groupby(
-            frame["symbol"], group_keys=False
+            feature_group, group_keys=False
         ).transform(lambda series: series.rolling(60).mean())
         market_square_mean = (market_return**2).groupby(
-            frame["symbol"], group_keys=False
+            feature_group, group_keys=False
         ).transform(lambda series: series.rolling(60).mean())
         covariance = cross_mean - asset_mean * market_mean
         market_variance = (market_square_mean - market_mean**2).replace(0, np.nan)
@@ -335,8 +425,15 @@ class FeatureEngine:
         )
         frame["industry_momentum_20"] = sector_lookup.reindex(sector_keys).to_numpy()
 
+        availability_sources = {
+            "value_score": frame["value_data_available"],
+            "quality_score": frame["quality_data_available"],
+            "growth_score": frame["growth_data_available"],
+            "size_score": frame["size_data_available"],
+        }
         for column in self.RESEARCH_FACTOR_COLUMNS:
-            frame[f"{column}_available"] = frame[column].notna().astype(float)
+            available = availability_sources.get(column, frame[column].notna())
+            frame[f"{column}_available"] = available.astype(float)
 
         for column in self.RESEARCH_FACTOR_COLUMNS:
             # Fundamental scores are already cross-sectional.  Ranking every
@@ -349,16 +446,54 @@ class FeatureEngine:
             axis=1, skipna=True
         )
         frame["fundamental_coverage"] = frame[self.COVERAGE_COLUMNS].mean(axis=1)
+        self._add_benchmark_features(frame, benchmark_frame, benchmark_symbol)
         return frame
 
     def build_training_frame(
-        self, daily_frame: pd.DataFrame, horizon_days: int = 5
+        self,
+        daily_frame: pd.DataFrame,
+        horizon_days: int = 5,
+        *,
+        benchmark_frame: pd.DataFrame | None = None,
+        benchmark_symbol: str = "000300",
+        label_mode: str = "cross_sectional",
+        feature_frame: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        frame = self.build_features(daily_frame)
-        group = frame.groupby("symbol", group_keys=False)
+        if horizon_days <= 0:
+            raise ValueError("horizon_days must be positive")
+        if label_mode not in {"cross_sectional", "benchmark_excess"}:
+            raise ValueError(
+                "label_mode must be cross_sectional or benchmark_excess"
+            )
+        frame = (
+            self.build_features(
+                daily_frame,
+                benchmark_frame=benchmark_frame,
+                benchmark_symbol=benchmark_symbol,
+            )
+            if feature_frame is None
+            else feature_frame.copy()
+        )
+        feature_group = frame.get("_feature_group", frame["symbol"])
+        group = frame.groupby(feature_group, group_keys=False)
         frame["future_return"] = group["close"].shift(-horizon_days) / frame["close"] - 1
-        benchmark = frame.groupby("trade_date")["future_return"].transform("mean")
-        frame["label"] = frame["future_return"] - benchmark
+        if label_mode == "cross_sectional":
+            benchmark = frame.groupby("trade_date")["future_return"].transform("mean")
+            frame["label"] = frame["future_return"] - benchmark
+        else:
+            if benchmark_frame is None:
+                raise ValueError(
+                    "benchmark_frame is required for benchmark_excess labels"
+                )
+            benchmark_returns = self._future_benchmark_returns(
+                benchmark_frame,
+                horizon_days=horizon_days,
+                benchmark_symbol=benchmark_symbol,
+            )
+            frame["benchmark_future_return"] = frame["trade_date"].map(
+                benchmark_returns
+            )
+            frame["label"] = frame["future_return"] - frame["benchmark_future_return"]
         return frame.dropna(subset=self.FACTOR_COLUMNS + ["label"]).reset_index(drop=True)
 
     def latest(self, daily_frame: pd.DataFrame) -> pd.DataFrame:
@@ -369,6 +504,88 @@ class FeatureEngine:
             .tail(1)
             .reset_index(drop=True)
         )
+
+    @classmethod
+    def _add_benchmark_features(
+        cls,
+        frame: pd.DataFrame,
+        benchmark_frame: pd.DataFrame | None,
+        benchmark_symbol: str,
+    ) -> None:
+        """Attach causal market-regime features to a daily stock frame."""
+
+        for column in cls.BENCHMARK_FEATURE_COLUMNS:
+            frame[column] = np.nan
+        if benchmark_frame is None or benchmark_frame.empty:
+            return
+        required = {"trade_date", "close"}
+        if not required.issubset(benchmark_frame.columns):
+            return
+        benchmark = benchmark_frame.copy()
+        if "benchmark_symbol" in benchmark.columns:
+            selected = benchmark[
+                benchmark["benchmark_symbol"].astype(str).eq(str(benchmark_symbol))
+            ]
+            if selected.empty:
+                return
+            benchmark = selected
+        benchmark["trade_date"] = cls._normalize_dates(benchmark["trade_date"])
+        benchmark["close"] = pd.to_numeric(benchmark["close"], errors="coerce")
+        benchmark = (
+            benchmark.dropna(subset=["trade_date", "close"])
+            .query("close > 0")
+            .sort_values("trade_date")
+            .drop_duplicates("trade_date", keep="last")
+        )
+        if benchmark.empty:
+            return
+        close = benchmark.set_index("trade_date")["close"]
+        daily_return = close.pct_change()
+        market = pd.DataFrame(index=close.index)
+        for window in (5, 20, 60):
+            market[f"benchmark_return_{window}"] = close.pct_change(window)
+        market["benchmark_volatility_20"] = daily_return.rolling(20).std()
+        market["benchmark_drawdown_60"] = close / close.rolling(60).max() - 1
+        dates = cls._normalize_dates(frame["trade_date"])
+        for column in cls.BENCHMARK_FEATURE_COLUMNS:
+            frame[column] = dates.map(market[column])
+
+    @staticmethod
+    def _future_benchmark_returns(
+        benchmark_frame: pd.DataFrame,
+        *,
+        horizon_days: int,
+        benchmark_symbol: str,
+    ) -> pd.Series:
+        required = {"trade_date", "close"}
+        missing = required - set(benchmark_frame.columns)
+        if missing:
+            raise ValueError(f"benchmark frame missing columns: {sorted(missing)}")
+        benchmark = benchmark_frame.copy()
+        if "benchmark_symbol" in benchmark.columns:
+            benchmark = benchmark[
+                benchmark["benchmark_symbol"].astype(str).eq(str(benchmark_symbol))
+            ]
+        benchmark["trade_date"] = FeatureEngine._normalize_dates(benchmark["trade_date"])
+        benchmark["close"] = pd.to_numeric(benchmark["close"], errors="coerce")
+        benchmark = (
+            benchmark.dropna(subset=["trade_date", "close"])
+            .query("close > 0")
+            .sort_values("trade_date")
+            .drop_duplicates("trade_date", keep="last")
+        )
+        if benchmark.empty:
+            raise ValueError(f"benchmark frame has no rows for {benchmark_symbol}")
+        close = benchmark.set_index("trade_date")["close"]
+        return close.shift(-horizon_days) / close - 1
+
+    @staticmethod
+    def _normalize_dates(values: pd.Series) -> pd.Series:
+        parsed = pd.to_datetime(values, errors="coerce")
+        timezone = getattr(parsed.dt, "tz", None)
+        if timezone is not None:
+            parsed = parsed.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+        return parsed.dt.normalize()
 
     @staticmethod
     def validate_point_in_time(frame: pd.DataFrame) -> None:

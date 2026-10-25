@@ -130,6 +130,7 @@ interface Order {
   symbol: string
   name: string
   board: string
+  sector: string
   side: string
   quantity: number
   filled_quantity: number
@@ -141,6 +142,23 @@ interface Order {
   eligible_at: string
   reject_reason: string | null
   is_margin_order: boolean
+}
+
+interface RebalanceRecord {
+  record_id: string
+  fill_id: string
+  order_id: string
+  timestamp: string
+  symbol: string
+  name: string
+  board: string
+  industry: string
+  side: string
+  quantity: number
+  price: number
+  notional: number
+  price_source: string
+  data_timestamp: string | null
 }
 
 interface RiskEvent {
@@ -200,6 +218,7 @@ interface Dashboard {
   signals: Signal[]
   orders: Order[]
   fills: unknown[]
+  rebalance_records: RebalanceRecord[]
   risk_events: RiskEvent[]
   manual_records: unknown[]
   reports: Report[]
@@ -279,6 +298,8 @@ const status = computed<Status>(() => dashboard.value?.status ?? {
 })
 const signals = computed(() => dashboard.value?.signals ?? [])
 const orders = computed(() => dashboard.value?.orders ?? [])
+const rebalanceRecords = computed(() => dashboard.value?.rebalance_records ?? [])
+const latestRebalanceRecords = computed(() => rebalanceRecords.value.slice(0, 6))
 const positions = computed(() => dashboard.value?.positions ?? [])
 const risks = computed(() => dashboard.value?.risk_events ?? [])
 const reports = computed(() => dashboard.value?.reports ?? [])
@@ -356,6 +377,15 @@ function time(value: string | null | undefined): string {
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
+function dateTime(value: string | null | undefined): string {
+  if (!value) return '--'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleString('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  })
+}
+
 function statusLabel(value: string): string {
   const labels: Record<string, string> = {
     RUNNING: '运行中', STOPPED: '已停止', DEGRADED: '降级', ERROR: '异常', OFFLINE: '离线',
@@ -368,6 +398,14 @@ function statusLabel(value: string): string {
 
 function boardLabel(board: string): string {
   return ({ MAIN: '主板', CHINEXT_300: '创业板', STAR_688: '科创板' } as Record<string, string>)[board] ?? board
+}
+
+function sectorLabel(sector: string | null | undefined): string {
+  return sector && !['UNKNOWN', ''].includes(sector) ? sector : '待补充'
+}
+
+function sideLabel(side: string): string {
+  return ({ BUY: '买入', SELL: '卖出', BORROW_SELL: '融券卖出', BUY_TO_COVER: '买入回补' } as Record<string, string>)[side] ?? side
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -661,7 +699,7 @@ onUnmounted(() => {
               <div class="signal-list">
                 <div v-for="signal in signals.slice(0, 6)" :key="signal.signal_id" class="signal-row">
                   <div class="symbol-avatar" :class="signal.action === 'BUY' ? 'buy' : 'hold'"><ArrowUpRight v-if="signal.action === 'BUY'" :size="15" aria-hidden="true" /><LineChart v-else :size="15" aria-hidden="true" /></div>
-                  <div class="signal-main"><strong>{{ signal.symbol }} <span>{{ signal.name }}</span></strong><small>{{ boardLabel(signal.board) }} · {{ signal.sector }}</small></div>
+                   <div class="signal-main"><strong>{{ signal.symbol }} <span>{{ signal.name }}</span></strong><small>{{ boardLabel(signal.board) }} · {{ sectorLabel(signal.sector) }}</small></div>
                   <div class="signal-score"><span>评分</span><strong>{{ signal.score.toFixed(3) }}</strong></div>
                   <div class="action-pill" :class="signal.action.toLowerCase()">{{ signal.action === 'BUY' ? '买入' : '观察' }}</div>
                 </div>
@@ -689,22 +727,38 @@ onUnmounted(() => {
           <div class="content-grid bottom-grid">
             <article class="panel positions-panel">
               <div class="panel-header"><div><p class="eyebrow">PORTFOLIO</p><h3>当前持仓 <span class="count-badge">{{ positions.length }}</span></h3></div><button class="text-button" type="button" @click="activeView = 'diagnostics'">风险详情 <ArrowUpRight :size="15" aria-hidden="true" /></button></div>
-              <div class="table-wrap"><table><thead><tr><th>标的</th><th>板块</th><th>现价</th><th>持仓</th><th>成本</th><th>市值</th><th>状态</th></tr></thead><tbody><tr v-for="position in positions" :key="position.symbol"><td><strong>{{ position.symbol }}</strong><small>{{ position.name }}</small></td><td><span class="board-tag">{{ boardLabel(position.board) }}</span></td><td class="mono">¥{{ position.last_price.toFixed(2) }}</td><td class="mono">{{ position.long_qty.toLocaleString() }}</td><td class="mono">¥{{ position.long_avg_cost.toFixed(2) }}</td><td class="mono">¥{{ money(position.market_value) }}</td><td><span class="table-state stable">正常</span></td></tr></tbody></table></div>
+               <div class="table-wrap"><table><thead><tr><th>标的</th><th>板块</th><th>行业</th><th>现价</th><th>持仓</th><th>成本</th><th>市值</th><th>状态</th></tr></thead><tbody><tr v-for="position in positions" :key="position.symbol"><td><strong>{{ position.symbol }}</strong><small>{{ position.name }}</small></td><td><span class="board-tag">{{ boardLabel(position.board) }}</span></td><td class="industry-cell">{{ sectorLabel(position.sector) }}</td><td class="mono">¥{{ position.last_price.toFixed(2) }}</td><td class="mono">{{ position.long_qty.toLocaleString() }}</td><td class="mono">¥{{ position.long_avg_cost.toFixed(2) }}</td><td class="mono">¥{{ money(position.market_value) }}</td><td><span class="table-state stable">正常</span></td></tr></tbody></table></div>
             </article>
 
             <article class="panel risk-panel">
               <div class="panel-header"><div><p class="eyebrow">RISK WATCH</p><h3>风险监控</h3></div><ShieldAlert :size="18" class="panel-icon" aria-hidden="true" /></div>
               <div class="risk-list"><div v-for="risk in latestRisks" :key="risk.event_id" class="risk-row" :class="risk.severity.toLowerCase()"><div class="risk-icon"><AlertTriangle :size="15" aria-hidden="true" /></div><div><strong>{{ risk.code }}</strong><p>{{ risk.message }}</p><small>{{ time(risk.created_at) }}</small></div></div><div v-if="!latestRisks.length" class="healthy-state"><Check :size="20" aria-hidden="true" /><strong>当前没有高优先级风险</strong><span>Runner 会持续检查敞口、现金和两融指标。</span></div></div>
-            </article>
-          </div>
+           </article>
+         </div>
+
+          <article class="panel full-panel rebalance-panel">
+            <div class="panel-header"><div><p class="eyebrow">EXECUTION HISTORY</p><h3>已成交调仓 <span class="count-badge">{{ rebalanceRecords.length }}</span></h3><p class="panel-description">这里只记录 PaperBroker 已模拟成交的买卖；行业接口未授权的标的显示“待补充”。</p></div><button class="text-button" type="button" @click="activeView = 'orders'">查看完整记录 <ArrowUpRight :size="15" aria-hidden="true" /></button></div>
+            <div v-if="latestRebalanceRecords.length" class="table-wrap"><table aria-label="最近已成交调仓记录"><thead><tr><th>时间</th><th>标的</th><th>行业</th><th>方向</th><th>数量</th><th>成交价</th><th>金额</th></tr></thead><tbody><tr v-for="record in latestRebalanceRecords" :key="record.record_id"><td class="mono">{{ dateTime(record.timestamp) }}</td><td><strong>{{ record.symbol }}</strong><small>{{ record.name }} · {{ boardLabel(record.board) }}</small></td><td class="industry-cell">{{ sectorLabel(record.industry) }}</td><td><span class="direction-text" :class="record.side.toLowerCase()">{{ sideLabel(record.side) }}</span></td><td class="mono">{{ record.quantity.toLocaleString() }} 股</td><td class="mono">¥{{ record.price.toFixed(2) }}</td><td class="mono">¥{{ money(record.notional) }}</td></tr></tbody></table></div>
+            <div v-else class="empty-state">暂无已成交调仓记录。成交后会在这里显示时间、方向和数量。</div>
+          </article>
         </section>
 
         <section v-else-if="activeView === 'signals'" class="page-view single-page">
-           <article class="panel full-panel"><div class="panel-header"><div><p class="eyebrow">MODEL OUTPUT</p><h3>信号中心</h3><p class="panel-description">当前模型版本：{{ status.model_version }}。信号只生成建议，不发送真实委托。</p></div><button class="button primary" type="button" @click="rebalance"><RefreshCw :size="15" aria-hidden="true" />重新评分</button></div><div class="table-wrap"><table><thead><tr><th>排名</th><th>标的</th><th>板块</th><th>评分</th><th>目标仓位</th><th>动作</th><th>解释</th></tr></thead><tbody><tr v-for="(signal, index) in signals" :key="signal.signal_id"><td class="muted-number">{{ String(index + 1).padStart(2, '0') }}</td><td><strong>{{ signal.symbol }}</strong><small>{{ signal.name }}</small></td><td><span class="board-tag">{{ boardLabel(signal.board) }}</span> {{ signal.sector }}</td><td class="score-cell">{{ signal.score.toFixed(3) }}</td><td>{{ pct(signal.target_weight) }}</td><td><span class="action-pill" :class="signal.action.toLowerCase()">{{ signal.action === 'BUY' ? '买入' : signal.action === 'SELL' ? '卖出' : '观察' }}</span></td><td class="reason-cell">{{ signal.reason }}</td></tr></tbody></table></div></article>
+           <article class="panel full-panel"><div class="panel-header"><div><p class="eyebrow">MODEL OUTPUT</p><h3>信号中心</h3><p class="panel-description">当前模型版本：{{ status.model_version }}。信号只生成建议，不发送真实委托；行业未授权时显示“待补充”。</p></div><button class="button primary" type="button" @click="rebalance"><RefreshCw :size="15" aria-hidden="true" />重新评分</button></div><div class="table-wrap"><table><thead><tr><th>排名</th><th>标的</th><th>板块</th><th>行业</th><th>评分</th><th>目标仓位</th><th>动作</th><th>解释</th></tr></thead><tbody><tr v-for="(signal, index) in signals" :key="signal.signal_id"><td class="muted-number">{{ String(index + 1).padStart(2, '0') }}</td><td><strong>{{ signal.symbol }}</strong><small>{{ signal.name }}</small></td><td><span class="board-tag">{{ boardLabel(signal.board) }}</span></td><td class="industry-cell">{{ sectorLabel(signal.sector) }}</td><td class="score-cell">{{ signal.score.toFixed(3) }}</td><td>{{ pct(signal.target_weight) }}</td><td><span class="action-pill" :class="signal.action.toLowerCase()">{{ signal.action === 'BUY' ? '买入' : signal.action === 'SELL' ? '卖出' : '观察' }}</span></td><td class="reason-cell">{{ signal.reason }}</td></tr></tbody></table></div></article>
           <article class="panel action-card"><div class="action-card-icon"><BrainCircuit :size="20" aria-hidden="true" /></div><div><h3>训练本地模型</h3><p>使用当前回放数据生成 Point-in-Time 训练集，保存 LightGBM 模型版本和特征清单。</p></div><button class="button secondary" type="button" @click="trainModel">开始训练</button></article>
         </section>
 
-        <section v-else-if="activeView === 'orders'" class="page-view single-page"><article class="panel full-panel"><div class="panel-header"><div><p class="eyebrow">PAPER BROKER</p><h3>订单队列</h3><p class="panel-description">{{ status.mode === 'paper_manual' ? '人工确认模式：只有确认后才进入模拟撮合。' : '自动纸盘模式：订单会自动确认并进入模拟撮合。' }}</p></div><div class="order-summary"><span>{{ pendingOrders.length }} 待处理</span><span>{{ dashboard?.fills.length ?? 0 }} 成交</span></div></div><div class="table-wrap"><table><thead><tr><th>订单</th><th>方向</th><th>数量</th><th>限价</th><th>状态</th><th>原因</th><th>操作</th></tr></thead><tbody><tr v-for="order in orders" :key="order.order_id"><td><strong>{{ order.symbol }}</strong><small>{{ order.order_id }}</small></td><td><span class="direction-text" :class="order.side.toLowerCase()">{{ order.side === 'BUY' ? '买入' : order.side === 'SELL' ? '卖出' : order.side }}</span></td><td class="mono">{{ order.quantity.toLocaleString() }}<small> / {{ order.filled_quantity.toLocaleString() }}</small></td><td class="mono">{{ order.limit_price ? `¥${order.limit_price.toFixed(2)}` : '--' }}</td><td><span class="table-state" :class="order.status.toLowerCase()">{{ statusLabel(order.status) }}</span></td><td class="reason-cell">{{ order.reject_reason || order.reason }}</td><td><div class="row-actions" v-if="order.status === 'DRAFT'"><button class="icon-button tiny" type="button" aria-label="修改数量" @click="openModifyOrder(order)"><Pencil :size="15" /></button><button class="icon-button tiny approve" type="button" aria-label="确认订单" @click="confirmOrder(order.order_id)"><Check :size="15" /></button><button class="icon-button tiny reject" type="button" aria-label="拒绝订单" @click="rejectOrder(order.order_id)"><X :size="15" /></button></div><div class="row-actions" v-else-if="['SUBMITTED', 'PARTIAL_FILLED'].includes(order.status)"><button class="icon-button tiny reject" type="button" aria-label="撤销订单" @click="cancelOrder(order.order_id)"><Ban :size="15" /></button></div><span v-else class="muted-number">—</span></td></tr></tbody></table></div></article></section>
+        <section v-else-if="activeView === 'orders'" class="page-view single-page">
+          <article class="panel full-panel">
+            <div class="panel-header"><div><p class="eyebrow">PAPER BROKER</p><h3>订单队列</h3><p class="panel-description">{{ status.mode === 'paper_manual' ? '人工确认模式：只有确认后才进入模拟撮合。' : '自动纸盘模式：订单会自动确认并进入模拟撮合。' }}</p></div><div class="order-summary"><span>{{ pendingOrders.length }} 待处理</span><span>{{ dashboard?.fills.length ?? 0 }} 成交</span></div></div>
+            <div class="table-wrap"><table aria-label="纸盘订单队列"><thead><tr><th>订单</th><th>板块</th><th>行业</th><th>方向</th><th>数量</th><th>限价</th><th>状态</th><th>原因</th><th>操作</th></tr></thead><tbody><tr v-for="order in orders" :key="order.order_id"><td><strong>{{ order.symbol }}</strong><small>{{ order.order_id }}</small></td><td><span class="board-tag">{{ boardLabel(order.board) }}</span></td><td class="industry-cell">{{ sectorLabel(order.sector) }}</td><td><span class="direction-text" :class="order.side.toLowerCase()">{{ sideLabel(order.side) }}</span></td><td class="mono">{{ order.quantity.toLocaleString() }}<small> / {{ order.filled_quantity.toLocaleString() }}</small></td><td class="mono">{{ order.limit_price ? `¥${order.limit_price.toFixed(2)}` : '--' }}</td><td><span class="table-state" :class="order.status.toLowerCase()">{{ statusLabel(order.status) }}</span></td><td class="reason-cell">{{ order.reject_reason || order.reason }}</td><td><div class="row-actions" v-if="order.status === 'DRAFT'"><button class="icon-button tiny" type="button" aria-label="修改数量" @click="openModifyOrder(order)"><Pencil :size="15" /></button><button class="icon-button tiny approve" type="button" aria-label="确认订单" @click="confirmOrder(order.order_id)"><Check :size="15" /></button><button class="icon-button tiny reject" type="button" aria-label="拒绝订单" @click="rejectOrder(order.order_id)"><X :size="15" /></button></div><div class="row-actions" v-else-if="['SUBMITTED', 'PARTIAL_FILLED'].includes(order.status)"><button class="icon-button tiny reject" type="button" aria-label="撤销订单" @click="cancelOrder(order.order_id)"><Ban :size="15" /></button></div><span v-else class="muted-number">—</span></td></tr></tbody></table></div>
+          </article>
+          <article class="panel full-panel rebalance-panel">
+            <div class="panel-header"><div><p class="eyebrow">EXECUTION HISTORY</p><h3>已成交调仓记录 <span class="count-badge">{{ rebalanceRecords.length }}</span></h3><p class="panel-description">按成交时间倒序；数量是实际模拟成交股数，行业来自股票主数据或行业接口。</p></div></div>
+            <div v-if="rebalanceRecords.length" class="table-wrap"><table aria-label="已成交调仓记录"><thead><tr><th>成交时间</th><th>标的</th><th>板块</th><th>行业</th><th>方向</th><th>成交股数</th><th>成交价</th><th>成交金额</th><th>价格来源</th></tr></thead><tbody><tr v-for="record in rebalanceRecords" :key="record.record_id"><td class="mono">{{ dateTime(record.timestamp) }}</td><td><strong>{{ record.symbol }}</strong><small>{{ record.name }}</small></td><td><span class="board-tag">{{ boardLabel(record.board) }}</span></td><td class="industry-cell">{{ sectorLabel(record.industry) }}</td><td><span class="direction-text" :class="record.side.toLowerCase()">{{ sideLabel(record.side) }}</span></td><td class="mono">{{ record.quantity.toLocaleString() }}</td><td class="mono">¥{{ record.price.toFixed(2) }}</td><td class="mono">¥{{ money(record.notional) }}</td><td class="source-cell">{{ record.price_source || '--' }}</td></tr></tbody></table></div>
+            <div v-else class="empty-state">暂无已成交调仓记录。PaperBroker 成交后会在这里留下可追溯记录。</div>
+          </article>
+        </section>
 
         <section v-else-if="activeView === 'reports'" class="page-view single-page"><article class="panel full-panel"><div class="panel-header"><div><p class="eyebrow">END OF DAY</p><h3>收盘报告</h3><p class="panel-description">报告同时保存为 HTML、Markdown 和 JSON，所有结论关联模型与数据版本。</p></div><button class="button primary" type="button" @click="generateReport"><FileText :size="15" aria-hidden="true" />生成今日报告</button></div><div class="report-list"><div v-for="report in reports" :key="report.report_date" class="report-card"><div class="report-date"><strong>{{ report.report_date }}</strong><span :class="report.status === 'OK' ? 'stable' : 'error-state'">{{ report.status }}</span></div><div class="report-summary">{{ report.summary }}</div><div class="report-meta"><span>模型 {{ report.model_version }}</span><span>换手 {{ pct(report.turnover) }}</span><span>{{ report.fills_count }} 笔成交</span><span>数据 {{ statusLabel(report.data_status ?? 'UNKNOWN') }}</span></div><div v-if="report.research_metrics" class="report-research"><div class="report-research-header"><strong>样本外 Walk-forward</strong><span :class="report.research_metrics?.status === 'OK' ? 'stable' : 'error-state'">{{ report.research_metrics?.status ?? 'UNKNOWN' }}</span></div><div class="report-research-grid"><div><span>测试 IC</span><strong :class="researchMetricClass(report.research_metrics?.test_ic_mean)">{{ pct(report.research_metrics?.test_ic_mean) }}</strong></div><div><span>Top/Bottom</span><strong :class="researchMetricClass(report.research_metrics?.test_top_bottom_spread_mean)">{{ pct(report.research_metrics?.test_top_bottom_spread_mean) }}</strong></div><div><span>正 IC 折数</span><strong :class="researchMetricClass(report.research_metrics?.test_ic_positive_ratio)">{{ pct(report.research_metrics?.test_ic_positive_ratio) }}</strong></div><div><span>Sharpe</span><strong :class="researchMetricClass(report.research_metrics?.sharpe)">{{ decimal(report.research_metrics?.sharpe) }}</strong></div><div><span>因子覆盖</span><strong :class="researchMetricClass(report.research_metrics?.factor_coverage_mean)">{{ pct(report.research_metrics?.factor_coverage_mean) }}</strong></div></div><small>{{ report.research_metrics?.data_start ?? '--' }} → {{ report.research_metrics?.data_end ?? '--' }} · {{ report.research_metrics?.fold_count ?? '--' }} 折 · {{ report.research_metrics?.message ?? '仅用于研究评估，不自动晋级纸盘模型' }}</small></div></div><div v-if="!reports.length" class="empty-state">尚未生成报告。收盘后点击生成，或由 Runner 调度。</div></div></article></section>
 

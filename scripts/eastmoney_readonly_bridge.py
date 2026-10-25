@@ -95,6 +95,9 @@ def _selected_instrument(row: Mapping[str, Any]) -> dict[str, Any]:
         "margin_ratio",
         "board",
         "price_tick",
+        "industry",
+        "industry_name",
+        "sector",
     )
     return {field: _json_safe(row.get(field)) for field in fields if field in row}
 

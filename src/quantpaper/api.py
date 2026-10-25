@@ -114,6 +114,12 @@ def get_dashboard() -> dict[str, Any]:
     return runtime.dashboard()
 
 
+@app.get("/api/v1/rebalance-records", tags=["orders"])
+def list_rebalance_records(limit: int = 100) -> list[dict[str, Any]]:
+    runtime.refresh_from_ledger()
+    return jsonable(runtime.rebalance_records(max(1, min(int(limit), 500))))
+
+
 def _terminal_feed_store() -> TerminalFeedStore:
     provider = getattr(runtime, "provider", None)
     store = getattr(provider, "terminal_feed_store", None)

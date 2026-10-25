@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from typing import Any
 from uuid import uuid4
 
 import pandas as pd
 
 from .config import PortfolioConfig
 from .domain import (
+    INDUSTRY_CAP_MIN_COVERAGE,
     AccountSnapshot,
     OrderIntent,
     OrderSide,
@@ -17,6 +19,8 @@ from .domain import (
     Security,
     Signal,
     TargetPosition,
+    known_sectors,
+    sector_coverage,
     utc_now,
 )
 from .rules import TradingRules
@@ -39,6 +43,57 @@ class PortfolioEngine:
         self.config = config
         self.rules = rules or TradingRules()
         self.cash_floor = cash_floor
+        # Whether the industry cap was enforceable on the most recent plan, and
+        # why.  Mirrors the research backtester's disclosure so the two paths can
+        # be compared instead of silently disagreeing about exposure.
+        self._industry_disclosure: dict[str, Any] = {
+            "industry_cap_applied": False,
+            "industry_cap_reason": "no target plan was built",
+            "sector_coverage": 0.0,
+            "distinct_known_sectors": 0,
+            "sector_source": "UNAVAILABLE:sector",
+        }
+
+    @property
+    def industry_disclosure(self) -> dict[str, Any]:
+        return dict(self._industry_disclosure)
+
+    def _describe_industry_cap(self, security_labels: list[str]) -> bool:
+        """Decide whether the industry cap is enforceable, and disclose why.
+
+        The cap needs a real classification to diversify anything.  With no
+        industry field every candidate resolves to the ``"UNKNOWN"`` placeholder,
+        so the cap degenerates into ``industry_weight_cap / base_weight`` names and
+        pins the book at that exposure however many positions the configuration
+        asks for -- 0.25 / 0.03 = 8 names = 24% invested.  Enforce it only when the
+        classification actually covers the candidates, and record the decision
+        rather than under-investing in silence.
+        """
+
+        distinct = known_sectors(security_labels)
+        coverage = sector_coverage(security_labels)
+        placeholder_count = len(security_labels) - int(
+            round(coverage * len(security_labels))
+        )
+        applied = coverage >= INDUSTRY_CAP_MIN_COVERAGE and bool(distinct)
+        if applied:
+            reason = (
+                f"行业覆盖 {coverage:.1%}，{len(distinct)} 个行业，上限可执行"
+            )
+        else:
+            reason = (
+                f"行业覆盖仅 {coverage:.1%}"
+                f"（未知行业 {placeholder_count}/{len(security_labels)}），"
+                "行业上限无法分散风险，已停用"
+            )
+        self._industry_disclosure = {
+            "industry_cap_applied": applied,
+            "industry_cap_reason": reason,
+            "sector_coverage": round(coverage, 6),
+            "distinct_known_sectors": len(distinct),
+            "sector_source": "AVAILABLE:sector" if applied else "UNAVAILABLE:sector",
+        }
+        return applied
 
     def build_targets(
         self,
@@ -65,6 +120,9 @@ class PortfolioEngine:
         deployable = account_equity * (1 - self.cash_floor)
         count = max(1, min(self.config.max_positions, len(eligible)))
         base_weight = min(self.config.single_weight_cap, deployable / account_equity / count)
+        industry_cap_applied = self._describe_industry_cap(
+            [securities[symbol].sector for symbol in eligible["symbol"]]
+        )
         targets: list[TargetPosition] = []
         signals: list[Signal] = []
         positions = positions or {}
@@ -80,7 +138,8 @@ class PortfolioEngine:
                 break
             security = securities[row.symbol]
             if (
-                sector_weights.get(security.sector, 0.0) + base_weight
+                industry_cap_applied
+                and sector_weights.get(security.sector, 0.0) + base_weight
                 > self.config.industry_weight_cap + 1e-9
             ):
                 continue

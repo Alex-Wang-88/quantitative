@@ -14,6 +14,7 @@ from .broker import PaperBroker
 from .config import AppConfig, load_config
 from .data import MarketDataProvider, ProviderUnavailable, build_provider
 from .domain import (
+    AccountSnapshot,
     Board,
     DataMode,
     OrderIntent,
@@ -24,7 +25,9 @@ from .domain import (
     RunMode,
     RunnerStatus,
     Signal,
+    TargetPosition,
     jsonable,
+    security_status_disclosure,
     utc_now,
 )
 from .features import FeatureEngine
@@ -32,6 +35,7 @@ from .ledger import Ledger
 from .model import FactorBaselineModel, LightGBMModel
 from .notifications import NotificationSink, build_notifier
 from .portfolio import OrderPlanner, PortfolioEngine
+from .provenance import STALE, UNKNOWN, report_provenance
 from .report import ReportGenerator
 from .risk import RiskEngine
 from .rules import TradingRules
@@ -96,6 +100,9 @@ class RuntimeService:
         self.last_heartbeat: datetime | None = None
         self.last_error: str | None = startup_error
         self.last_session_rebalance: str | None = None
+        self.last_session_rebalance_attempt: str | None = None
+        self.session_rebalance_retry_after: datetime | None = None
+        self.last_close_report: str | None = None
         self._shared_data_status: dict[str, Any] | None = None
         self.model_version = "factor-baseline-v0.1"
         self.model_name = "factor_baseline"
@@ -175,6 +182,16 @@ class RuntimeService:
                 self.runner_status = RunnerStatus.STOPPED
         self.last_error = raw.get("last_error")
         self.last_session_rebalance = raw.get("last_session_rebalance")
+        self.last_session_rebalance_attempt = raw.get("last_session_rebalance_attempt")
+        retry_after = raw.get("session_rebalance_retry_after")
+        if retry_after:
+            try:
+                self.session_rebalance_retry_after = datetime.fromisoformat(retry_after)
+            except ValueError:
+                self.session_rebalance_retry_after = None
+        else:
+            self.session_rebalance_retry_after = None
+        self.last_close_report = raw.get("last_close_report")
         shared_data = raw.get("data")
         self._shared_data_status = shared_data if isinstance(shared_data, dict) else None
         stored_market = raw.get("market")
@@ -333,8 +350,23 @@ class RuntimeService:
             else None
         )
         fold_count = numeric(stats.get("fold_count"))
+        status = "OK" if bool(quality.get("ok")) else "DEGRADED"
+        origin = report_provenance(path)
+        message = "仅用于研究评估，不自动晋级纸盘模型"
+        if origin["verdict"] == STALE:
+            # A stale artifact must not be quoted as if it described the current
+            # code.  Downgrade the status instead of hiding the lag in a field
+            # nobody reads, so the close report cannot look complete.
+            status = STALE
+            message = (
+                "研究报告早于产出代码，数字可能来自已不存在的版本；"
+                "仅用于研究评估，需重跑后再引用"
+            )
+        elif origin["verdict"] == UNKNOWN and origin["artifact_written_at"]:
+            status = "DEGRADED"
+            message = f"{origin['detail']}；仅用于研究评估"
         return {
-            "status": "OK" if bool(quality.get("ok")) else "DEGRADED",
+            "status": status,
             "source": path.name,
             "data_start": quality.get("start_date"),
             "data_end": quality.get("end_date"),
@@ -354,7 +386,13 @@ class RuntimeService:
             "max_drawdown": numeric(stats.get("max_drawdown")),
             "turnover": numeric(stats.get("turnover")),
             "trade_count": numeric(stats.get("trade_count")),
-            "message": "仅用于研究评估，不自动晋级纸盘模型",
+            "report_written_at": origin["artifact_written_at"],
+            "newest_producer_at": origin["newest_producer_at"],
+            "newer_producers": origin["newer_producers"],
+            "provenance_verdict": origin["verdict"],
+            "provenance_lag_seconds": origin["lag_seconds"],
+            "provenance_detail": origin["detail"],
+            "message": message,
         }
 
     def _load_persisted_model(self) -> None:
@@ -401,7 +439,7 @@ class RuntimeService:
         try:
             loaded = LightGBMModel.load(
                 path,
-                expected_feature_columns=list(self.feature_engine.FACTOR_COLUMNS),
+                expected_feature_columns=list(self.feature_engine.MODEL_FEATURE_COLUMNS),
             )
         except Exception as exc:
             self.trained_model = None
@@ -555,6 +593,12 @@ class RuntimeService:
                 self.runner_status = RunnerStatus.STOPPED
                 self._persist_runtime()
                 return self.status()
+            # Live feeds can remain on the last valid 15:04 quote after the
+            # market closes.  Use wall-clock time for the close-report
+            # trigger in live mode so the report is still produced once even
+            # when the next quote never arrives.
+            if getattr(self.provider, "name", "") != "replay":
+                self._maybe_generate_close_report(datetime.now(SHANGHAI))
             try:
                 self._prepare_realtime_poll()
                 quotes = self.provider.next_quotes()
@@ -578,6 +622,8 @@ class RuntimeService:
             self.clock = event_time
             if event_time.date() > previous_date:
                 self._handle_new_trading_day(previous_date, event_time)
+            if getattr(self.provider, "name", "") == "replay":
+                self._maybe_generate_close_report(event_time)
             self._maybe_rebalance_at_session_open(event_time)
             if self.mode == RunMode.PAPER_AUTO:
                 self.broker.auto_confirm_drafts(event_time)
@@ -629,6 +675,46 @@ class RuntimeService:
             active.update(list(self.securities)[: max(30, self.config.portfolio.max_positions)])
         setter(active)
 
+    def _close_report_time(self) -> time:
+        configured = str(self.config.execution.close_report_time).strip()
+        try:
+            return datetime.strptime(configured, "%H:%M").time()
+        except ValueError:
+            logger.warning("invalid close_report_time %r; using 15:05", configured)
+            return time(15, 5)
+
+    def _generate_report_once(
+        self, report_date: str, *, notify: bool = True
+    ) -> dict[str, Any] | None:
+        if self.last_close_report == report_date:
+            return None
+        if any(item.get("report_date") == report_date for item in self.ledger.list_reports()):
+            self.last_close_report = report_date
+            return None
+        report = self.generate_report(
+            report_date=report_date,
+            notify=notify,
+            sync=False,
+        )
+        self.last_close_report = report_date
+        return report
+
+    def _maybe_generate_close_report(self, now: datetime) -> None:
+        if not self.config.execution.close_report_enabled:
+            return
+        local = now.replace(tzinfo=SHANGHAI) if now.tzinfo is None else now.astimezone(SHANGHAI)
+        if local.time() < self._close_report_time():
+            return
+        report_date = local.date().isoformat()
+        try:
+            self._generate_report_once(report_date)
+            self._persist_runtime()
+        except Exception as exc:
+            self.last_error = f"收盘报告生成失败: {exc}"
+            self.runner_status = RunnerStatus.DEGRADED
+            self.notifier.notify("收盘报告异常", self.last_error, "error")
+            self._persist_runtime()
+
     def _handle_new_trading_day(self, previous_date: date, event_time: datetime) -> None:
         weekdays = 0
         cursor = previous_date
@@ -649,7 +735,7 @@ class RuntimeService:
                 self.last_error = f"周度模型重训失败，继续使用旧模型: {exc}"
                 self.notifier.notify("模型重训失败", self.last_error, "warning")
         try:
-            self.generate_report(report_date=previous_date.isoformat(), notify=True, sync=False)
+            self._generate_report_once(previous_date.isoformat(), notify=True)
             self.rebalance(sync=False)
         except Exception as exc:
             self.last_error = f"新交易日任务失败: {exc}"
@@ -672,14 +758,45 @@ class RuntimeService:
         session_key = self._session_open_key(event_time)
         if not session_key or session_key == self.last_session_rebalance:
             return
+        local_event_time = (
+            event_time.replace(tzinfo=SHANGHAI)
+            if event_time.tzinfo is None
+            else event_time.astimezone(SHANGHAI)
+        )
+        if (
+            self.last_session_rebalance_attempt == session_key
+            and self.session_rebalance_retry_after is not None
+            and local_event_time < self.session_rebalance_retry_after
+        ):
+            return
+        self.last_session_rebalance_attempt = session_key
+        self.session_rebalance_retry_after = local_event_time + timedelta(
+            seconds=max(1, int(execution.session_rebalance_retry_seconds))
+        )
         data_mode = self.provider.status().mode
         if data_mode in {DataMode.STALE, DataMode.UNAVAILABLE}:
             self.last_error = f"开盘调仓已暂停：行情状态为 {data_mode.value}"
             self.runner_status = RunnerStatus.DEGRADED
             self.notifier.notify("开盘调仓暂停", self.last_error, "warning")
+            self._persist_runtime()
             return
-        self.rebalance(sync=False)
+        try:
+            result = self.rebalance(sync=False)
+        except Exception as exc:
+            self.last_error = f"开盘调仓暂缓，将在重试间隔后重试: {exc}"
+            self.runner_status = RunnerStatus.DEGRADED
+            logger.exception("session rebalance failed")
+            self.notifier.notify("开盘调仓异常", self.last_error, "warning")
+            self._persist_runtime()
+            return
+        if result.get("blocked_reason"):
+            self.last_error = str(result["blocked_reason"])
+            self.runner_status = RunnerStatus.DEGRADED
+            self._persist_runtime()
+            return
         self.last_session_rebalance = session_key
+        self.session_rebalance_retry_after = None
+        self._persist_runtime()
 
     def _session_open_key(self, event_time: datetime) -> str | None:
         """Return a date/session key only inside the configured open window."""
@@ -733,10 +850,63 @@ class RuntimeService:
         self._persist_runtime()
         return order
 
+    def _sync_security_metadata(self) -> None:
+        """Refresh labels learned by the provider, such as industry names."""
+
+        try:
+            current = {
+                item.symbol: item for item in self.provider.get_security_master()
+            }
+        except ProviderUnavailable:
+            return
+        if not current:
+            return
+        self.securities.update(current)
+        # PaperBroker keeps its own immutable security lookup for rule checks.
+        # Keep that lookup in sync when an optional metadata endpoint fills a
+        # previously UNKNOWN industry.
+        self.broker.securities.update(current)
+        for symbol, position in self.broker.positions.items():
+            security = current.get(symbol)
+            if security:
+                position.sector = security.sector
+
+    def _security_status_disclosure(self) -> dict[str, Any]:
+        """State which trading-status filters actually ran, on what evidence.
+
+        The live path excludes special-treatment names while the security master
+        is built and drops suspended names from the tradable set, whereas the
+        research archive supports neither filter.  That difference changes which
+        names a book can even hold, so it is reported rather than inferred from
+        the absence of a warning.
+        """
+
+        provided = getattr(self.provider, "security_status", None)
+        if isinstance(provided, dict) and provided:
+            return dict(provided)
+        return security_status_disclosure(
+            st_applied=False,
+            suspension_applied=False,
+            source=f"UNAVAILABLE:{getattr(self.provider, 'name', 'unknown')}",
+            basis="当前 provider 不提供证券状态字段，未执行交易状态过滤",
+            universe_note="无过滤：ST 与停牌证券均可进入候选池",
+            marginable_securities=sum(
+                1 for item in self.securities.values() if item.marginable
+            ),
+            shortable_securities=sum(
+                1 for item in self.securities.values() if item.shortable
+            ),
+            capability_note=(
+                "账户能力取自证券主数据；保证金可用证券为 0 时，"
+                "保证金与强平子系统不会触发，无论 config 的 margin_enabled 为何"
+            ),
+        )
+
     def rebalance(self, sync: bool = True) -> dict[str, Any]:
         if sync:
             self.refresh_from_ledger()
         daily = self.provider.get_daily_frame()
+        self._sync_security_metadata()
         provider_status = self.provider.status()
         if provider_status.mode in {DataMode.STALE, DataMode.UNAVAILABLE} and getattr(
             self.provider, "name", ""
@@ -788,7 +958,7 @@ class RuntimeService:
             quotes,
             self.model_version,
             self.clock,
-            max_turnover_value=self._remaining_turnover_budget(quotes),
+            max_turnover_value=self._remaining_turnover_budget(targets, account, quotes),
         )
         existing_open_symbols = {
             item.symbol
@@ -852,20 +1022,23 @@ class RuntimeService:
         training = self.feature_engine.build_training_frame(
             daily, self.config.model.prediction_horizon_days
         )
-        model = LightGBMModel(feature_columns=list(self.feature_engine.FACTOR_COLUMNS))
+        model = LightGBMModel(
+            feature_columns=list(self.feature_engine.MODEL_FEATURE_COLUMNS)
+        )
         artifact = model.fit(
             training,
             artifact_dir=self.config.model.artifact_dir,
             min_training_rows=self.config.model.min_training_rows,
             validation_fraction=self.config.model.validation_fraction,
             min_validation_days=self.config.model.min_validation_days,
+            validation_gap_days=self.config.model.validation_gap_days,
         )
         self.trained_model = model
         self.model_version = artifact.model_version
         self.model_name = artifact.model_name
         self.model_metrics = dict(artifact.metrics)
         self.model_artifact_path = artifact.artifact_path
-        self.strategy_version = "factor-model-v0.2"
+        self.strategy_version = "factor-model-v0.3"
         self._persist_runtime()
         return jsonable(artifact)
 
@@ -896,6 +1069,8 @@ class RuntimeService:
             factor_coverage=self.factor_coverage,
             data_status=str(data_mode),
             research_metrics=self._load_walkforward_metrics(),
+            industry_disclosure=self.portfolio_engine.industry_disclosure,
+            security_status_disclosure=self._security_status_disclosure(),
         )
         if notify:
             self.notifier.notify("收盘报告已生成", report.summary)
@@ -921,17 +1096,83 @@ class RuntimeService:
             "model_metrics": self.model_metrics,
             "model_artifact_path": self.model_artifact_path,
             "factor_coverage": self.factor_coverage,
+            # Same name the research backtester publishes, so the two paths'
+            # turnover budgets can be diffed instead of eyeballed.
+            "peak_daily_turnover_budget": round(
+                float(getattr(self, "_peak_budget_rate", 0.0)), 6
+            ),
             "data": jsonable(data_status),
             "last_heartbeat": jsonable(self.last_heartbeat),
             "clock": jsonable(self.clock),
             "last_error": self.last_error,
             "last_session_rebalance": self.last_session_rebalance,
+            "last_session_rebalance_attempt": self.last_session_rebalance_attempt,
+            "session_rebalance_retry_after": jsonable(self.session_rebalance_retry_after),
+            "last_close_report": self.last_close_report,
             "session_date": self.session_date,
             "session_start_equity": self.session_start_equity,
             "market": self.market_overview,
             "notifications_enabled": self.config.notifications.enabled,
             "paper_only": True,
         }
+
+    def rebalance_records(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return actual paper fills enriched with security metadata.
+
+        These are fills rather than order intents, so a record only appears
+        after the PaperBroker has simulated a trade.  Joining the fill with
+        the current security master keeps industry and board labels available
+        without duplicating them in the broker's immutable fill schema.
+        """
+
+        records: list[dict[str, Any]] = []
+        bounded = max(1, min(int(limit), 500))
+        for fill in reversed(self.broker.fills[-bounded:]):
+            order = self.broker.orders.get(fill.order_id)
+            security = self.securities.get(fill.symbol)
+            industry = (
+                security.sector
+                if security and security.sector not in {"", "UNKNOWN"}
+                else order.sector
+                if order and order.sector not in {"", "UNKNOWN"}
+                else "UNKNOWN"
+            )
+            board = (
+                security.board.value
+                if security
+                else order.board.value
+                if order
+                else ""
+            )
+            records.append(
+                {
+                    "record_id": fill.fill_id,
+                    "fill_id": fill.fill_id,
+                    "order_id": fill.order_id,
+                    "timestamp": fill.timestamp,
+                    "symbol": fill.symbol,
+                    "name": (
+                        order.name
+                        if order
+                        else security.name
+                        if security
+                        else fill.symbol
+                    ),
+                    "board": board,
+                    "industry": industry,
+                    "sector": industry,
+                    "side": fill.side.value,
+                    "quantity": fill.quantity,
+                    "price": fill.price,
+                    "notional": round(fill.quantity * fill.price, 2),
+                    "price_source": fill.price_source,
+                    "data_timestamp": fill.data_timestamp,
+                    "run_id": fill.run_id,
+                    "strategy_version": fill.strategy_version,
+                    "model_version": fill.model_version,
+                }
+            )
+        return records
 
     def _current_data_status(self) -> Any:
         """Prefer a newer Runner observation over the API process cache.
@@ -975,6 +1216,7 @@ class RuntimeService:
             "signals": jsonable(getattr(self, "signals", [])),
             "orders": jsonable(list(self.broker.orders.values())),
             "fills": jsonable(self.broker.fills[-100:]),
+            "rebalance_records": jsonable(self.rebalance_records()),
             "risk_events": jsonable(self.risk_events),
             "manual_records": self.manual_records[-20:],
             "reports": self.ledger.list_reports(),
@@ -1043,8 +1285,50 @@ class RuntimeService:
             if (item.symbol, item.side.value, item.reason) not in recent_attempts
         ]
 
-    def _remaining_turnover_budget(self, quotes: dict[str, Any]) -> float:
-        budget = self.config.account.initial_capital * self.config.portfolio.max_daily_turnover
+    def _turnover_budget_rate(
+        self, targets: list[TargetPosition], account: AccountSnapshot
+    ) -> float:
+        """This session's two-sided turnover budget, as a share of equity.
+
+        Mirrors the research backtester exactly, because a budget the two paths
+        compute differently makes their equity curves incomparable.  Two things
+        the live path used to get wrong:
+
+        * the base was ``initial_capital`` rather than *current* equity, so the
+          budget stopped scaling with the account as it grew;
+        * there was no deployment exemption, so funding the book from cash was
+          charged against the rotation cap.  Reaching a 90% book then took about
+          five sessions (0.20 x a fixed 1,000,000 per session) where the backtest
+          arrives in one, and the difference shows up as a permanently lower
+          early exposure -- indistinguishable, in a report, from the
+          industry-cap bug that produced the same symptom.
+
+        Holding the target book is the objective; rotation is what
+        ``max_daily_turnover`` limits.  The deficit to the target gross exposure
+        is therefore reserved first and only the remainder bounds rotation.
+        """
+
+        equity = max(0.0, account.total_equity)
+        if equity <= 0:
+            return 0.0
+        long_value = sum(
+            position.long_market_value for position in self.broker.positions.values()
+        )
+        current_gross = long_value / equity
+        target_gross = sum(max(0.0, target.target_weight) for target in targets)
+        deployment_gap = max(0.0, target_gross - current_gross)
+        budget_rate = max(self.config.portfolio.max_daily_turnover, deployment_gap)
+        self._peak_budget_rate = max(getattr(self, "_peak_budget_rate", 0.0), budget_rate)
+        return budget_rate
+
+    def _remaining_turnover_budget(
+        self,
+        targets: list[TargetPosition],
+        account: AccountSnapshot,
+        quotes: dict[str, Any],
+    ) -> float:
+        equity = max(0.0, account.total_equity)
+        budget = equity * self._turnover_budget_rate(targets, account)
         current_date = self.clock.date()
         used = 0.0
         for item in self.broker.orders.values():

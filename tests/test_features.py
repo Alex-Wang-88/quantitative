@@ -111,3 +111,64 @@ def test_f1_price_volume_candidates_are_point_in_time_research_features() -> Non
         full_cut[engine.F1_FACTOR_COLUMNS],
         truncated_cut[engine.F1_FACTOR_COLUMNS],
     )
+
+
+def test_benchmark_regime_features_and_excess_labels_are_point_in_time() -> None:
+    dates = pd.date_range("2025-01-02", periods=80, freq="D")
+    rows: list[dict[str, object]] = []
+    for index, trade_date in enumerate(dates):
+        for symbol, drift in (("000001", 0.001), ("000002", 0.0005)):
+            close = (10.0 if symbol == "000001" else 20.0) * (1 + drift) ** index
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "trade_date": trade_date,
+                    "open": close,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "amount": 1_000_000,
+                }
+            )
+    benchmark = pd.DataFrame(
+        {
+            "benchmark_symbol": "000300",
+            "trade_date": dates,
+            "close": [3000.0 * (1.0004**index) for index in range(len(dates))],
+        }
+    )
+
+    engine = FeatureEngine()
+    daily = pd.DataFrame(rows)
+    features = engine.build_features(daily, benchmark_frame=benchmark)
+    assert features[engine.BENCHMARK_FEATURE_COLUMNS].iloc[-1].notna().all()
+
+    training = engine.build_training_frame(
+        daily,
+        horizon_days=5,
+        benchmark_frame=benchmark,
+        label_mode="benchmark_excess",
+        feature_frame=features,
+    )
+    sample = training.iloc[-1]
+    expected = sample["future_return"] - sample["benchmark_future_return"]
+    assert sample["label"] == pytest.approx(expected)
+
+
+def test_cross_sectional_profile_drops_date_constant_market_features() -> None:
+    engine = FeatureEngine()
+    profile = engine.feature_profile("candidate-v3")
+
+    # Every market-regime column is identical across stocks on a given date,
+    # so it can never rank one stock against another.  It must not sit inside
+    # the cross-sectional ranking model.
+    for column in engine.BENCHMARK_FEATURE_COLUMNS:
+        assert column not in profile
+    assert "size_data_available" not in profile
+    assert set(profile) >= set(engine.CANDIDATE_FACTOR_COLUMNS)
+    assert set(engine.feature_profile("candidate-v2")) > set(profile)
+
+
+def test_feature_profile_rejects_unknown_name() -> None:
+    with pytest.raises(ValueError, match="unknown feature profile"):
+        FeatureEngine.feature_profile("does-not-exist")

@@ -6,8 +6,10 @@ import os
 import queue
 import subprocess
 import threading
+import time as time_module
 import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,16 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from .data import ProviderUnavailable
-from .domain import Board, DataMode, DataStatus, QuoteSnapshot, Security, board_for_symbol
+from .domain import (
+    Board,
+    DataMode,
+    DataStatus,
+    QuoteSnapshot,
+    Security,
+    board_for_symbol,
+    has_special_treatment_marker,
+    security_status_disclosure,
+)
 from .rules import TradingRules
 from .terminal_feed import TerminalFeedStore
 
@@ -32,13 +43,24 @@ class EastmoneyBridgeClient:
         bridge_script: str = "scripts/eastmoney_readonly_bridge.py",
         token_env: str = "QUANTPAPER_EASTMONEY_TOKEN",
         timeout_seconds: float = 120.0,
+        startup_timeout_seconds: float = 20.0,
+        startup_attempts: int = 2,
+        request_attempts: int = 2,
+        retry_backoff_seconds: float = 1.0,
     ) -> None:
         self.python_executable = python_executable
         self.bridge_script = bridge_script
         self.token_env = token_env
         self.timeout_seconds = timeout_seconds
+        self.startup_timeout_seconds = max(1.0, float(startup_timeout_seconds))
+        self.startup_attempts = max(1, int(startup_attempts))
+        self.request_attempts = max(1, int(request_attempts))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self._process: subprocess.Popen[str] | None = None
-        self._responses: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        # A response queue belongs to exactly one bridge process.  Reusing a
+        # queue after a process exits lets the reader thread's sentinel from
+        # the old process poison the next startup attempt.
+        self._responses: queue.Queue[dict[str, Any] | None] | None = None
         self._lock = threading.RLock()
         self._reader: threading.Thread | None = None
         self._closed = False
@@ -88,45 +110,62 @@ class EastmoneyBridgeClient:
             raise ProviderUnavailable(f"Eastmoney SDK Python 不存在: {python_path}")
         if not script_path.exists():
             raise ProviderUnavailable(f"Eastmoney 只读桥接脚本不存在: {script_path}")
-        try:
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            process = subprocess.Popen(
-                [str(python_path), str(script_path)],
-                cwd=str(self.project_root),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=creationflags,
-                env=self._environment(),
-            )
-        except OSError as exc:
-            raise ProviderUnavailable(f"Eastmoney 只读桥接进程启动失败: {exc}") from exc
-        self._process = process
-        self._reader = threading.Thread(
-            target=self._read_responses,
-            args=(process,),
-            name="eastmoney-bridge-reader",
-            daemon=True,
-        )
-        self._reader.start()
-        try:
-            ready = self._responses.get(timeout=self.timeout_seconds)
-        except queue.Empty as exc:
+        last_error = "桥接进程未能启动"
+        for attempt in range(self.startup_attempts):
             self._stop_process()
-            raise ProviderUnavailable("Eastmoney 只读桥接初始化超时") from exc
-        if ready is None or not ready.get("ok") or ready.get("event") != "ready":
+            responses: queue.Queue[dict[str, Any] | None] = queue.Queue()
+            try:
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                process = subprocess.Popen(
+                    [str(python_path), str(script_path)],
+                    cwd=str(self.project_root),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    creationflags=creationflags,
+                    env=self._environment(),
+                )
+            except OSError as exc:
+                last_error = f"Eastmoney 只读桥接进程启动失败: {exc}"
+            else:
+                self._process = process
+                self._responses = responses
+                self._reader = threading.Thread(
+                    target=self._read_responses,
+                    args=(process, responses),
+                    name="eastmoney-bridge-reader",
+                    daemon=True,
+                )
+                self._reader.start()
+                try:
+                    ready = responses.get(timeout=self.startup_timeout_seconds)
+                except queue.Empty:
+                    last_error = "Eastmoney 只读桥接初始化超时"
+                else:
+                    if ready is not None and ready.get("ok") and ready.get("event") == "ready":
+                        return
+                    last_error = (
+                        ready.get("error", "未收到就绪消息")
+                        if ready
+                        else "桥接进程已退出"
+                    )
             self._stop_process()
-            message = ready.get("error", "未收到就绪消息") if ready else "桥接进程已退出"
-            raise ProviderUnavailable(f"Eastmoney 只读桥接初始化失败: {message}")
+            if attempt + 1 < self.startup_attempts and self.retry_backoff_seconds:
+                time_module.sleep(self.retry_backoff_seconds * (attempt + 1))
+        raise ProviderUnavailable(f"Eastmoney 只读桥接初始化失败: {last_error}")
 
-    def _read_responses(self, process: subprocess.Popen[str]) -> None:
+    def _read_responses(
+        self,
+        process: subprocess.Popen[str],
+        responses: queue.Queue[dict[str, Any] | None],
+    ) -> None:
         stdout = process.stdout
         if stdout is None:
-            self._responses.put(None)
+            responses.put(None)
             return
         try:
             for line in stdout:
@@ -135,13 +174,14 @@ class EastmoneyBridgeClient:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(value, dict):
-                    self._responses.put(value)
+                    responses.put(value)
         finally:
-            self._responses.put(None)
+            responses.put(None)
 
     def _stop_process(self) -> None:
         process = self._process
         self._process = None
+        self._responses = None
         if process is None:
             return
         if process.poll() is None:
@@ -152,31 +192,59 @@ class EastmoneyBridgeClient:
                 process.kill()
                 process.wait(timeout=2)
 
+    def restart(self) -> None:
+        """Recycle only this read-only bridge process.
+
+        The vendor SDK owns native resources outside Python's garbage
+        collector.  Long archive jobs therefore need an explicit, bounded
+        process lifetime even when each request has returned successfully.
+        The next request starts a fresh bridge lazily; the client itself
+        remains usable.
+        """
+
+        with self._lock:
+            if self._closed:
+                return
+            self._stop_process()
+
     def request(self, action: str, **payload: Any) -> Any:
         with self._lock:
-            if self._process is None or self._process.poll() is not None:
-                self._stop_process()
-                self._start()
-            process = self._process
-            if process is None or process.stdin is None:
-                raise ProviderUnavailable("Eastmoney 只读桥接进程不可用")
-            request_id = uuid.uuid4().hex
-            request = {"request_id": request_id, "action": action, **payload}
-            try:
-                process.stdin.write(json.dumps(request, ensure_ascii=True) + "\n")
-                process.stdin.flush()
-                response = self._responses.get(timeout=self.timeout_seconds)
-            except (BrokenPipeError, OSError, queue.Empty) as exc:
-                self._stop_process()
-                if isinstance(exc, queue.Empty):
-                    raise ProviderUnavailable("Eastmoney 只读桥接请求超时") from exc
-                raise ProviderUnavailable("Eastmoney 只读桥接进程连接中断") from exc
-            if response is None:
-                self._stop_process()
-                raise ProviderUnavailable("Eastmoney 只读桥接进程已退出")
-            if not response.get("ok"):
-                raise ProviderUnavailable(str(response.get("error", "Eastmoney API 请求失败")))
-            return response.get("data")
+            for attempt in range(self.request_attempts):
+                if self._process is None or self._process.poll() is not None:
+                    self._stop_process()
+                    self._start()
+                process = self._process
+                responses = self._responses
+                if process is None or process.stdin is None or responses is None:
+                    raise ProviderUnavailable("Eastmoney 只读桥接进程不可用")
+                request_id = uuid.uuid4().hex
+                request = {"request_id": request_id, "action": action, **payload}
+                try:
+                    process.stdin.write(json.dumps(request, ensure_ascii=True) + "\n")
+                    process.stdin.flush()
+                    response = responses.get(timeout=self.timeout_seconds)
+                except (BrokenPipeError, OSError, queue.Empty) as exc:
+                    self._stop_process()
+                    if attempt + 1 >= self.request_attempts:
+                        if isinstance(exc, queue.Empty):
+                            raise ProviderUnavailable("Eastmoney 只读桥接请求超时") from exc
+                        raise ProviderUnavailable("Eastmoney 只读桥接进程连接中断") from exc
+                    if self.retry_backoff_seconds:
+                        time_module.sleep(self.retry_backoff_seconds * (attempt + 1))
+                    continue
+                if response is None:
+                    self._stop_process()
+                    if attempt + 1 >= self.request_attempts:
+                        raise ProviderUnavailable("Eastmoney 只读桥接进程已退出")
+                    if self.retry_backoff_seconds:
+                        time_module.sleep(self.retry_backoff_seconds * (attempt + 1))
+                    continue
+                if not response.get("ok"):
+                    raise ProviderUnavailable(
+                        str(response.get("error", "Eastmoney API 请求失败"))
+                    )
+                return response.get("data")
+            raise ProviderUnavailable("Eastmoney 只读桥接请求失败")
 
     def close(self) -> None:
         with self._lock:
@@ -198,6 +266,39 @@ class EastmoneyProvider:
         ("000001", "SHSE"),  # 上证指数
         ("399001", "SZSE"),  # 深证成指
         ("000300", "SHSE"),  # 沪深300
+    )
+
+    #: Canonical fundamental value columns, including the raw bridge aliases.
+    #: These are exactly the fields that back
+    #: :attr:`FeatureEngine.COVERAGE_COLUMNS` -- ``pe``/``pb`` feed
+    #: ``value_data_available``, ``roe*`` feeds ``quality_data_available``,
+    #: ``profit_growth``/``revenue_growth`` feed ``growth_data_available`` and
+    #: ``market_cap``/``market_value``/``tot_mv``/``a_mv_ex_ltd`` feed
+    #: ``size_data_available``.  If none of them carries a value, the merged
+    #: frame produces ``fundamental_coverage == 0`` and a ranking model whose
+    #: valuation/quality/growth channels are entirely missing -- which must not
+    #: be reported as a healthy provider.
+    FUNDAMENTAL_VALUE_COLUMNS = frozenset(
+        {
+            "pe",
+            "pb",
+            "roe",
+            "roe_weight",
+            "roe_weight_avg",
+            "roe_avg",
+            "roe_cut",
+            "profit_growth",
+            "revenue_growth",
+            # Raw bridge aliases for the two growth fields.  ``_merge_fundamentals``
+            # renames these only when the canonical name is absent, so both
+            # spellings can reach the merged frame.
+            "net_prof_pcom_yoy",
+            "inc_oper_yoy",
+            "market_cap",
+            "market_value",
+            "tot_mv",
+            "a_mv_ex_ltd",
+        }
     )
 
     def __init__(
@@ -251,6 +352,10 @@ class EastmoneyProvider:
         self.terminal_feed_store = TerminalFeedStore(feed_candidate)
         self._securities: dict[str, Security] = {}
         self._instrument_rows: dict[str, dict[str, Any]] = {}
+        # Names dropped from the master because they carry a special-treatment
+        # prefix.  Counted, not just dropped, so the runtime can disclose the
+        # exclusion instead of letting it look like a smaller universe.
+        self._special_treatment_excluded = 0
         self._quotes: dict[str, QuoteSnapshot] = {}
         self._cumulative_volume: dict[str, float] = {}
         self._realtime_symbols: list[str] | None = None
@@ -297,6 +402,26 @@ class EastmoneyProvider:
         return bool(value) and str(value).strip().lower() not in {"0", "false", "none"}
 
     @staticmethod
+    def _industry_name_from_row(row: Mapping[str, Any]) -> str:
+        """Extract a displayable industry name without inventing one."""
+
+        for key in (
+            "industry_name",
+            "industry",
+            "sector",
+            "sw_l1_name",
+            "industry_name1",
+            "industry_name_1",
+        ):
+            value = row.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text.lower() not in {"nan", "none", "null", "unknown"}:
+                return text
+        return "UNKNOWN"
+
+    @staticmethod
     def _timestamp(value: Any, fallback: datetime) -> datetime:
         if value is None or value == "":
             return fallback
@@ -336,7 +461,14 @@ class EastmoneyProvider:
             if len(symbol) != 6:
                 continue
             name = str(row.get("sec_name") or row.get("sec_abbr") or symbol).strip()
-            if name.upper().startswith(("ST", "*ST")):
+            # Special-treatment names never enter the security master, so they can
+            # never be scored, targeted or traded.  That exclusion is deliberate
+            # -- but it was previously silent *and* incomplete: the old prefix
+            # test missed the ``S*ST`` shape, letting those names into the live
+            # universe while a backtest over the archive still contained all of
+            # them.  Count what is dropped so the runtime can disclose it.
+            if has_special_treatment_marker(name):
+                self._special_treatment_excluded += 1
                 continue
             self._instrument_rows[symbol] = dict(row)
             exchange = str(row.get("exchange") or "")
@@ -353,7 +485,7 @@ class EastmoneyProvider:
                 name=name,
                 exchange=exchange_name,
                 board=self._board(symbol),
-                sector="UNKNOWN",
+                sector=self._industry_name_from_row(row),
                 listed_date=listed_date,
                 is_st=self._bool(row.get("is_st")),
                 suspended=self._bool(row.get("is_suspended")),
@@ -662,12 +794,25 @@ class EastmoneyProvider:
                     industry_enabled=self.industry_enabled,
                 )
                 frame = self._merge_fundamentals(frame, fundamentals)
+                frame = self._merge_industries(frame, fundamentals)
                 errors = fundamentals.get("errors") if isinstance(fundamentals, Mapping) else None
                 if errors:
                     first = errors[0]
                     self._fundamental_warning = (
                         f"{len(errors)} 个基础面请求失败，首个失败项: "
                         f"{first.get('symbol', '')}/{first.get('dataset', '')}"
+                    )
+                elif self._usable_fundamental_cells(frame) == 0:
+                    # An empty payload is not a success.  ``errors`` only covers
+                    # requests that raised; a bridge that answers 200 with no
+                    # ``daily``/``reports`` rows (or rows that never join) leaves
+                    # ``fundamental_coverage`` at 0 while ``status()`` used to
+                    # report LIVE.  Surface it through the same channel so a
+                    # report cannot look complete with no valuation fields.
+                    self._fundamental_warning = (
+                        "基础面载荷为空：daily/reports 未返回任何可用字段"
+                        "（或返回的行与行情无法按 symbol/trade_date 对齐），"
+                        "因子覆盖率将退化为 0"
                     )
                 else:
                     self._fundamental_warning = None
@@ -677,15 +822,144 @@ class EastmoneyProvider:
                 # valuation or financial fields were unavailable.
                 self._fundamental_warning = str(exc)
                 self._last_error = None
-        frame["sector"] = frame["symbol"].map(
+        current_sectors = frame["symbol"].map(
             {symbol: security.sector for symbol, security in self._securities.items()}
         )
+        if "sector" not in frame.columns:
+            frame["sector"] = current_sectors
+        else:
+            frame["sector"] = frame["sector"].where(
+                frame["sector"].notna(), current_sectors
+            )
         frame = frame.dropna(subset=["trade_date", "close"]).sort_values(
             ["symbol", "trade_date"]
         )
         self._daily_cache = frame.reset_index(drop=True)
         self._daily_cache_date = today
         return self._daily_cache.copy()
+
+    def _merge_industries(
+        self, price_frame: pd.DataFrame, payload: Any
+    ) -> pd.DataFrame:
+        """Merge permissioned industry rows without applying future labels."""
+
+        if not isinstance(payload, Mapping):
+            return price_frame
+        raw = pd.DataFrame(payload.get("industries") or [])
+        if raw.empty or "symbol" not in raw.columns:
+            return price_frame
+        industries = self._normalise_industry_frame(raw)
+        industries = industries.dropna(subset=["symbol", "industry_as_of"])
+        industries = industries[industries["industry"].notna()]
+        if industries.empty:
+            return price_frame
+
+        latest = (
+            industries.sort_values(["symbol", "industry_as_of"])
+            .drop_duplicates("symbol", keep="last")
+        )
+        for row in latest.itertuples(index=False):
+            symbol = str(row.symbol)
+            industry = str(row.industry)
+            security = self._securities.get(symbol)
+            if security and industry:
+                self._securities[symbol] = replace(security, sector=industry)
+
+        base = price_frame.copy()
+        base["trade_date"] = self._date_key(base["trade_date"])
+        merged_pieces: list[pd.DataFrame] = []
+        industry_columns = [
+            "industry_as_of",
+            "industry",
+            "industry_source",
+            "industry_level",
+        ]
+        for symbol, current in base.groupby("symbol", sort=False):
+            current = current.sort_values("trade_date")
+            available = industries[industries["symbol"] == symbol][industry_columns]
+            if available.empty:
+                merged_pieces.append(current)
+                continue
+            merged_pieces.append(
+                pd.merge_asof(
+                    current,
+                    available.sort_values("industry_as_of"),
+                    left_on="trade_date",
+                    right_on="industry_as_of",
+                    direction="backward",
+                )
+            )
+        base = pd.concat(merged_pieces, ignore_index=True, sort=False)
+        if "sector" not in base.columns:
+            base["sector"] = pd.NA
+        if "industry" in base.columns:
+            base["sector"] = base["industry"].where(
+                base["industry"].notna(), base["sector"]
+            )
+        return base
+
+    @classmethod
+    def _normalise_industry_frame(cls, frame: pd.DataFrame) -> pd.DataFrame:
+        """Normalize vendor industry rows while preserving string labels."""
+
+        result = frame.copy()
+        result["symbol"] = result["symbol"].map(cls._normalize_symbol)
+        date_column = next(
+            (
+                column
+                for column in ("industry_as_of", "trade_date", "date", "as_of")
+                if column in result.columns
+            ),
+            None,
+        )
+        result["industry_as_of"] = (
+            cls._date_key(result[date_column]) if date_column else pd.NaT
+        )
+        industry = pd.Series(pd.NA, index=result.index, dtype="string")
+        for column in (
+            "industry_name",
+            "industry",
+            "sector",
+            "sw_l1_name",
+            "industry_name1",
+            "industry_name_1",
+        ):
+            if column not in result.columns:
+                continue
+            candidate = result[column].astype("string").str.strip()
+            candidate = candidate.mask(
+                candidate.str.lower().isin({"", "nan", "none", "null", "unknown"})
+            )
+            industry = industry.fillna(candidate)
+        result["industry"] = industry
+        if "industry_source" not in result.columns:
+            result["industry_source"] = ""
+        if "industry_level" not in result.columns:
+            result["industry_level"] = pd.NA
+        return result
+
+    @classmethod
+    def _usable_fundamental_cells(cls, frame: pd.DataFrame) -> int:
+        """Count populated fundamental values in a merged daily frame.
+
+        Merge can silently leave every fundamental column null in two ways: the
+        bridge returns no ``daily``/``reports`` rows at all, or it returns rows
+        whose symbols/dates never match the price frame.  Both collapse
+        ``fundamental_coverage`` to ``0`` while ``errors`` stays empty, so the
+        provider used to report ``LIVE`` for a frame with no valuation or
+        financial data.  Counting cells is the only signal that distinguishes
+        "empty payload" from "successful payload".
+        """
+
+        total = 0
+        for column in frame.columns:
+            base = str(column)
+            for suffix in ("_fundamental", "_report"):
+                base = base.removesuffix(suffix)
+            if base not in cls.FUNDAMENTAL_VALUE_COLUMNS:
+                continue
+            total += int(frame[column].notna().sum())
+        return total
 
     @classmethod
     def _merge_fundamentals(
@@ -852,6 +1126,51 @@ class EastmoneyProvider:
             if allowed is None or security.symbol in allowed
         }
 
+    @property
+    def security_status(self) -> dict[str, Any]:
+        """Which trading-status filters this provider actually enforced.
+
+        Both filters are real here, unlike on the research side: special
+        treatment is excluded while the master is built (by name prefix, since
+        the vendor sends no ``is_st``), and suspension comes from
+        ``instrument_master.is_suspended``.  Both are **current snapshots**, so
+        they are legitimate for live decisions and invalid for a historical
+        backtest -- stated in the disclosure rather than left to the reader.
+        """
+
+        suspended = sum(1 for item in self._securities.values() if item.suspended)
+        marginable = sum(1 for item in self._securities.values() if item.marginable)
+        shortable = sum(1 for item in self._securities.values() if item.shortable)
+        return security_status_disclosure(
+            st_applied=True,
+            suspension_applied=True,
+            source="security_master",
+            basis=(
+                "ST 由证券名称前缀识别（ST / *ST / SST / S*ST）；"
+                "停牌取自 instrument_master.is_suspended，该标记同时覆盖长期停牌与"
+                "已退市（退市股在册且不交易），因此它排除的不只是临时停牌。"
+                "两者均为当前快照，不是交易时点分类；PT 时代的特别转让标记不在此列，"
+                "归档中仅存的 PT 名称本身即为停牌状态"
+            ),
+            special_treatment_excluded=self._special_treatment_excluded,
+            suspension_excluded=suspended,
+            universe_note=(
+                "本路径在证券主数据构建时就排除了 ST 名称；研究归档按证券代码前缀选取"
+                "股票池，ST 股仍在池内参与训练与回测 ⇒ 两条路径的可交易域并不相同。"
+                "按归档主数据实测：5557 只 A 股中 320 只带 ST 标记（5.76%），"
+                "其中 7 只（S*ST 形状）是旧的两段前缀判断会漏掉的"
+            ),
+            marginable_securities=marginable,
+            shortable_securities=shortable,
+            capability_note=(
+                "本路径一律 marginable=False / shortable=False：instrument_master 的 "
+                "margin_ratio 只说明该证券在理论上可融资，不等于本账户可借入，"
+                "所以保证金与强平子系统在实盘不会触发。config 的 margin_enabled "
+                "已同步改为 false，避免出现"
+                "「声明开着保证金、实际上永远借不到钱」这种状态"
+            ),
+        )
+
     def status(self) -> DataStatus:
         if self._last_update is None:
             mode = DataMode.UNAVAILABLE
@@ -870,6 +1189,11 @@ class EastmoneyProvider:
             f"研究池 {len(self._securities)} 只，盘中默认行情池 "
             f"{len(self._realtime_universe_symbols)} 只"
         )
+        if not self._last_error and self._special_treatment_excluded:
+            message = (
+                f"{message}；已按名称前缀排除 ST 名称 "
+                f"{self._special_treatment_excluded} 只（当前快照）"
+            )
         if self._fundamental_warning:
             message = f"{message}；基础面因子不可用: {self._fundamental_warning}"
         return DataStatus(

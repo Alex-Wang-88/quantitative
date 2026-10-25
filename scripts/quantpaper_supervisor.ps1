@@ -46,6 +46,26 @@ $eastmoneyAdapterScriptPath = Join-Path $PSScriptRoot "eastmoney_terminal_adapte
 New-Item -ItemType Directory -Path $runtimePath -Force | Out-Null
 New-Item -ItemType Directory -Path (Split-Path -Parent $logPath) -Force | Out-Null
 
+# The scheduled task and the manual launcher can overlap during a restart.
+# Serialize them so two supervisors cannot race over the same client and PID
+# ownership files.
+$supervisorMutex = [System.Threading.Mutex]::new($false, "Local\QuantPaperSupervisor")
+$supervisorMutexHeld = $false
+try {
+    try {
+        $supervisorMutexHeld = $supervisorMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        $supervisorMutexHeld = $true
+    }
+} catch {
+    $supervisorMutex.Dispose()
+    throw "Unable to acquire the QuantPaper supervisor mutex: $($_.Exception.Message)"
+}
+if (-not $supervisorMutexHeld) {
+    $supervisorMutex.Dispose()
+    exit 0
+}
+
 function Write-SupervisorLog {
     param([string]$Message)
 
@@ -571,10 +591,27 @@ function Invoke-SupervisorCheck {
 
 Write-SupervisorLog "QuantPaper supervisor started. Active window: trading days 09:10-15:30 Asia/Shanghai."
 
-do {
-    Invoke-SupervisorCheck
-    if ($Once) {
-        break
+try {
+    do {
+        try {
+            Invoke-SupervisorCheck
+        } catch {
+            # A single Windows/API/client hiccup must not terminate the
+            # long-running supervisor. The next poll will retry the check.
+            Write-SupervisorLog "Supervisor check failed; will retry: $($_.Exception.Message)"
+        }
+        if ($Once) {
+            break
+        }
+        Start-Sleep -Seconds ([Math]::Max(15, $PollSeconds))
+    } while ($true)
+} finally {
+    if ($supervisorMutexHeld) {
+        try {
+            $supervisorMutex.ReleaseMutex()
+        } catch {
+            # The process is exiting; there is no useful recovery here.
+        }
     }
-    Start-Sleep -Seconds ([Math]::Max(15, $PollSeconds))
-} while ($true)
+    $supervisorMutex.Dispose()
+}
